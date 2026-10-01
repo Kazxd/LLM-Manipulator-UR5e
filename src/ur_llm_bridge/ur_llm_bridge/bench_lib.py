@@ -32,6 +32,12 @@ CASES = [
     ("multi_two_moves", "multistep",  "move the green cube to x 0.45 y 0.25 and the blue cube to x 0.45 y -0.25",
         ("all", [("at", "green", 0.45, 0.25), ("at", "blue", 0.45, -0.25)])),
     ("rel_next_to",     "relational", "move the green cube next to the blue cube", ("near", "green", "blue")),
+    ("rel_left",        "relational", "put the red cube to the left of the blue cube",
+        ("rel", "red", "blue", "left")),
+    ("rel_right",       "relational", "place the blue cube on the right side of the green cube",
+        ("rel", "blue", "green", "right")),
+    ("rel_front",       "relational", "put the red cube in front of the green cube",
+        ("rel", "red", "green", "front")),
     ("info_objects",    "info",       "what objects are on the table?",
         ("all", [("unchanged",), ("reply_has", "red", "green", "blue")])),
     ("info_home",       "info",       "go to the home position",  ("unchanged",)),
@@ -39,6 +45,9 @@ CASES = [
     ("refuse_ambiguous", "refusal",   "move the cube to the left", ("unchanged",)),
     ("refuse_range",    "refusal",    "put the red cube at x 3 and y 3", ("unchanged",)),
 ]
+
+# direction -> (axis index along which it points, sign); base frame, seen from the robot looking along +x
+REL_AXES = {"left": (1, 1.0), "right": (1, -1.0), "front": (0, -1.0), "behind": (0, 1.0)}
 
 
 def _c(name):
@@ -87,6 +96,13 @@ def evaluate(spec, poses, init, reply=""):
         d = _dxy(pa, pb)
         ok = 0.05 <= d <= 0.15 and abs(pa[2] - TABLE_Z) < 0.02
         return ok, f"{a}-{b} distance {d:.3f} (want 0.05-0.15), z={pa[2]:.3f}"
+    if kind == "rel":
+        axis, sign = REL_AXES[spec[3]]
+        diff = (pa[0] - pb[0], pa[1] - pb[1])
+        along, across = diff[axis] * sign, abs(diff[1 - axis])
+        ok = 0.06 <= along <= 0.16 and across < 0.04 and abs(pa[2] - TABLE_Z) < 0.02
+        return ok, (f"{a} {spec[3]} of {b}? along={along:.3f} (want 0.06-0.16) "
+                    f"across={across:.3f} (want <0.04) z={pa[2]:.3f}")
     return False, f"unknown check {kind}"
 
 

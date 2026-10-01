@@ -1,10 +1,14 @@
 """ROS-free LLM agent loop for Ollama tool calling (stdlib only, unit-testable)."""
-import json, re, urllib.request
+import json, math, re, urllib.request
 
 COLORS = ("red", "green", "blue")
 X_RANGE = (0.30, 0.90)    # safe workspace on the table (metres, base frame)
 Y_RANGE = (-0.40, 0.40)
-TOOL_NAMES = ("pick_object", "place_object", "move_home", "detect_objects")
+TOOL_NAMES = ("pick_object", "place_object", "place_relative", "move_home", "detect_objects")
+RELATIONS = ("left", "right", "front", "behind", "next_to")
+# Directions as seen from the robot base looking along +x (ROS base frame: +y is left).
+DIRS = {"left": (0.0, 1.0), "right": (0.0, -1.0), "front": (-1.0, 0.0), "behind": (1.0, 0.0)}
+MIN_GAP = 0.07            # min centre distance to any other cube (cube is 0.05)
 
 
 def _fn(name, desc, props, required=()):
@@ -25,6 +29,13 @@ TOOLS = [
         "or on the table at x,y metres (leave target empty).",
         {"target": {"type": "string", "enum": list(COLORS) + [""]},
          "x": {"type": "number"}, "y": {"type": "number"}}),
+    _fn("place_relative",
+        "Place the held cube on the table next to another cube. relation is seen from the robot base looking "
+        "along +x: left = +y side, right = -y side, front = toward the robot, behind = away from the robot, "
+        "next_to = any free side. distance_cm is the centre-to-centre distance (default 10).",
+        {"reference": {"type": "string", "enum": list(COLORS)},
+         "relation": {"type": "string", "enum": list(RELATIONS)},
+         "distance_cm": {"type": "number"}}, ["reference", "relation"]),
     _fn("move_home", "Move the arm to its home pose.", {}),
 ]
 
@@ -37,12 +48,14 @@ Rules:
 - Each request starts with a [Current scene] line: trust it, do not call detect_objects unless you need a fresh look.
 - If a tool returns success=false, read the message, try at most one sensible fix, otherwise tell the user what went wrong.
 - Never invent tools, colours or coordinates outside the workspace.
+- For "left of / right of / in front of / behind / next to <cube>": pick_object first, then place_relative. Do not compute coordinates yourself.
+- Directions are from the robot base looking along +x: left = +y, right = -y, front = toward the robot, behind = away from it.
 - ALWAYS act by calling a tool. Never describe a tool call or write a command in text instead of calling it.
 - If the request is ambiguous (which cube? which direction? how far?), do NOT guess: reply with one short clarifying question and call no tool.
 - Multi-step requests: do every step in order, one tool per turn, until all are done. Only report success if every tool result said success=true.
 - If a place fails, report the failure honestly; do not claim the task is complete.
-- When the task is finished (or impossible), reply in one or two short sentences with no tool call.
-- Stacking: build from the bottom up. The cube that stays on the bottom never moves; start by moving the middle cube onto it, then the next one onto that."""
+- Stacking: build from the bottom up. The cube that stays on the bottom never moves; start by moving the middle cube onto it, then the next one onto that.
+- When the task is finished (or impossible), reply in one or two short sentences with no tool call."""
 
 
 def validate(name, args):
@@ -72,14 +85,47 @@ def validate(name, args):
         if not (X_RANGE[0] <= x <= X_RANGE[1] and Y_RANGE[0] <= y <= Y_RANGE[1]):
             return None, f"x,y outside workspace x {X_RANGE}, y {Y_RANGE}"
         return {"target": "", "x": x, "y": y}, None
+    if name == "place_relative":
+        ref = str(args.get("reference", "")).lower()
+        rel = str(args.get("relation", "")).lower().replace(" ", "_")
+        if ref not in COLORS:
+            return None, f"reference must be one of {list(COLORS)}"
+        if rel not in RELATIONS:
+            return None, f"relation must be one of {list(RELATIONS)}"
+        try:
+            cm = float(args.get("distance_cm", 10))
+        except (TypeError, ValueError):
+            return None, "distance_cm must be a number"
+        if not 7 <= cm <= 30:
+            return None, "distance_cm must be between 7 and 30 (centre to centre)"
+        return {"reference": ref, "relation": rel, "distance": cm / 100.0}, None
     if name == "move_home":
         return {}, None
     return None, f"unknown tool '{name}'"
 
 
+def compute_relative(ref, relation, dist, others):
+    """ref=(x,y); others={colour:(x,y)} of cubes that stay on the table.
+    Return ((x,y), description) or (None, reason). next_to tries left, right, front, behind in turn."""
+    order = [relation] if relation in DIRS else list(DIRS)
+    reasons = []
+    for r in order:
+        dx, dy = DIRS[r]
+        x, y = ref[0] + dx * dist, ref[1] + dy * dist
+        if not (X_RANGE[0] <= x <= X_RANGE[1] and Y_RANGE[0] <= y <= Y_RANGE[1]):
+            reasons.append(f"{r}: outside the workspace")
+            continue
+        clash = [c for c, (ox, oy) in others.items() if math.hypot(x - ox, y - oy) < MIN_GAP]
+        if clash:
+            reasons.append(f"{r}: too close to the {', '.join(clash)} cube")
+            continue
+        return (x, y), r
+    return None, "no valid spot (" + "; ".join(reasons) + ")"
+
+
 def ollama_chat(host, model, messages, tools, timeout=300):
     body = json.dumps({"model": model, "messages": messages, "tools": tools, "stream": False, "think": False,
-                        "options": {"temperature": 0}, "keep_alive": "10m"}).encode()
+                       "options": {"temperature": 0}, "keep_alive": "10m"}).encode()
     req = urllib.request.Request(host.rstrip("/") + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
