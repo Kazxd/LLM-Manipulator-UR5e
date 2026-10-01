@@ -1,6 +1,7 @@
 """ROS-free benchmark pieces: test cases, ground-truth checks, gz fallback parser, summary."""
 import math, re, subprocess
 from collections import defaultdict
+from ur_llm_bridge.agent import zone_contains
 
 WORLD = "pick_place"
 POSE_TOPIC = f"/world/{WORLD}/pose/info"
@@ -25,6 +26,12 @@ CASES = [
     ("xy_blue",         "place_xy",   "put the blue cube at x 0.4 y 0.0",        ("at", "blue", 0.4, 0.0)),
     ("multi_stack3",    "multistep",  "stack all three cubes: red on the bottom, green in the middle, blue on top",
         ("all", [("on", "green", "red"), ("on", "blue", "green")])),
+    ("multi_tower_brg", "multistep",  "build a tower with blue on the bottom, red in the middle and green on top",
+        ("all", [("on", "red", "blue"), ("on", "green", "red")])),
+    ("zone_one_left",  "zone",       "put the red cube in the left zone", ("in_zone", "red", "left")),
+    ("zone_one_right", "zone",       "move the green cube into the right zone", ("in_zone", "green", "right")),
+    ("zone_sort3",     "zone",       "sort the cubes: red and green go in the left zone, blue goes in the right zone",
+        ("all", [("in_zone", "red", "left"), ("in_zone", "green", "left"), ("in_zone", "blue", "right")])),
     ("multi_there_back", "multistep", "put the red cube on the blue one, then put it back on the table at x 0.5 y 0.1",
         ("at", "red", 0.5, 0.1)),
     ("multi_xy_then_on", "multistep", "put the blue cube on the table at x 0.6 y 0.3, then put the red cube on top of it",
@@ -80,6 +87,9 @@ def evaluate(spec, poses, init, reply=""):
     pa = poses[a]
     if kind == "held":
         return pa[2] > 0.30, f"{a} z={pa[2]:.3f} (need >0.30)"
+    if kind == "in_zone":
+        ok = zone_contains(spec[2], pa[0], pa[1]) and abs(pa[2] - TABLE_Z) < 0.02
+        return ok, f"{a} in {spec[2]} zone? xy=({pa[0]:.3f}, {pa[1]:.3f}) z={pa[2]:.3f}"
     if kind == "at":
         d = _dxy(pa, (spec[2], spec[3]))
         ok = d < 0.05 and abs(pa[2] - TABLE_Z) < 0.02

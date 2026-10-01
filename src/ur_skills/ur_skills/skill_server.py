@@ -3,6 +3,8 @@
 Uses a 'magic gripper': a held cube is teleported to follow the tool in Gazebo.
 Only one skill runs at a time; a second goal is rejected while busy.
 Services: /reset_state (clear held state + go home), /get_status (what is held).
+Collision scene: the table, plus the cubes (re-detected after going home) except the held/picked one.
+Disable with  --ros-args -p collision_scene:=false
 """
 import math, time, threading, rclpy
 from rclpy.node import Node
@@ -29,7 +31,9 @@ TABLE_TOP = 0.20                  # must match the world file
 SHOULDER_Z = 0.163                # UR5e shoulder height
 REACH = 0.92                      # loose sanity gate only; MoveIt is the real judge
 RELEASE_CLEARANCE = 0.005         # lower the cube with 5 mm to spare, never start interpenetrating
+CUBE_MARGIN = 0.01                # collision boxes for cubes are inflated by this (total, all axes)
 COLORS = ("red", "green", "blue")
+IDENT_QUAT = (0.0, 0.0, 0.0, 1.0)
 
 
 def reachable(x, y, z):
@@ -61,6 +65,7 @@ class SkillServer(Node):
         self.pose_future = None
         self.active = False
         self.lock = threading.Lock()
+        self.collision_scene = self.declare_parameter("collision_scene", True).value
         self.create_timer(0.03, self.follow_tool, callback_group=self.cb)
 
         for cls, name, fn in ((MoveHome, "move_home", self.do_home),
@@ -73,7 +78,9 @@ class SkillServer(Node):
                          callback_group=self.cb)
         self.create_service(Trigger, "reset_state", self.on_reset, callback_group=self.cb)
         self.create_service(Trigger, "get_status", self.on_status, callback_group=self.cb)
-        self.get_logger().info("skill server ready: /move_home /pick_object /place_object /reset_state /get_status")
+        self.get_logger().info(
+            f"skill server ready: /move_home /pick_object /place_object /reset_state /get_status "
+            f"(collision_scene={self.collision_scene})")
 
     # ---------- action plumbing ----------
     def on_goal(self, goal):
@@ -93,6 +100,7 @@ class SkillServer(Node):
         try:
             with self.held_lock:
                 self.held = None
+            self.add_table()
             ok = self.home()
             res.success = ok
             res.message = "state cleared, at home" if ok else "state cleared but failed to move home"
@@ -170,13 +178,43 @@ class SkillServer(Node):
             time.sleep(0.02)
         return fut.result() if fut.done() else None
 
-    def locate(self, color):
-        req = DetectObjects.Request(); req.color = color
+    def locate_all(self):
+        """{colour: (x, y, top_z)} for every visible cube (first detection per colour)."""
+        req = DetectObjects.Request(); req.color = "all"
         res = self.wait(self.detect_cli.call_async(req))
         if res is None or not res.success:
-            return None
-        p = res.poses[0].pose.position
-        return p.x, p.y, p.z
+            return {}
+        out = {}
+        for i, p in zip(res.ids, res.poses):
+            out.setdefault(i.split("_")[0], (p.pose.position.x, p.pose.position.y, p.pose.position.z))
+        return out
+
+    def add_table(self):
+        if not self.collision_scene:
+            return
+        try:
+            self.moveit2.add_collision_box(id="table", size=(0.6, 0.8, 0.2), position=(0.6, 0.0, 0.1),
+                                           quat_xyzw=IDENT_QUAT, frame_id="base_link")
+        except Exception as e:
+            self.get_logger().warn(f"could not add table to the collision scene: {e}")
+
+    def sync_cubes(self, objs, exclude=()):
+        """Cubes as obstacles, except the held one and the `exclude` colours. Stale boxes are removed first."""
+        if not self.collision_scene:
+            return
+        held = (self.held or "").replace("_cube", "")
+        try:
+            for c in COLORS:
+                self.moveit2.remove_collision_object(id=f"{c}_cube")
+                if c in exclude or c == held or c not in objs:
+                    continue
+                x, y, top = objs[c]
+                self.moveit2.add_collision_box(id=f"{c}_cube", size=(CUBE + CUBE_MARGIN,) * 3,
+                                               position=(x, y, top - CUBE / 2),
+                                               quat_xyzw=IDENT_QUAT, frame_id="base_link")
+            time.sleep(0.3)            # scene updates are published asynchronously
+        except Exception as e:
+            self.get_logger().warn(f"could not update cubes in the collision scene: {e}")
 
     def z_hint(self, top):
         """Explain a suspicious detected height (usually an outdated world file)."""
@@ -196,6 +234,7 @@ class SkillServer(Node):
 
     # ---------- skills ----------
     def do_home(self, gh):
+        self.add_table()
         self.stage(gh, "moving home")
         return (True, "at home") if self.home() else (False, "failed to move home")
 
@@ -205,13 +244,15 @@ class SkillServer(Node):
             return False, f"unknown color '{color}', use one of {COLORS}"
         if self.held:
             return False, f"already holding {self.held}; place it first"
+        self.add_table()
         if not self.stage(gh, "moving home"): return False, "cancelled"
         if not self.home(): return False, "failed to move home"
         if not self.stage(gh, f"detecting {color}"): return False, "cancelled"
-        loc = self.locate(color)
-        if loc is None:
+        objs = self.locate_all()
+        if color not in objs:
             return False, f"no {color} object detected"
-        x, y, top = loc
+        self.sync_cubes(objs, exclude=(color,))
+        x, y, top = objs[color]
         self.get_logger().info(f"{color} detected at ({x:.3f}, {y:.3f}), top z={top:.3f}")
         hint = self.z_hint(top)
         grasp_z = (top - CUBE / 2) + TCP
@@ -236,17 +277,21 @@ class SkillServer(Node):
             return False, "not holding anything"
         r = gh.request
         target = r.target.lower()
+        if target and target not in COLORS:
+            return False, f"unknown target '{target}'"
         hint = ""
+        self.add_table()
         if not self.stage(gh, "moving home"): return False, "cancelled"
         if not self.home(): return False, "failed to move home"
+        objs = {}
+        if target or self.collision_scene:
+            if not self.stage(gh, f"detecting {target or 'objects'}"): return False, "cancelled"
+            objs = self.locate_all()
+            self.sync_cubes(objs)
         if target:
-            if target not in COLORS:
-                return False, f"unknown target '{target}'"
-            if not self.stage(gh, f"detecting {target}"): return False, "cancelled"
-            loc = self.locate(target)
-            if loc is None:
+            if target not in objs:
                 return False, f"no {target} object detected to place on"
-            x, y, surface = loc
+            x, y, surface = objs[target]
             self.get_logger().info(f"{target} detected at ({x:.3f}, {y:.3f}), top z={surface:.3f}")
             hint = self.z_hint(surface)
         else:

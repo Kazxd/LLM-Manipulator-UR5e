@@ -1,4 +1,4 @@
-"""Run: python3 test/test_bench_lib.py   (no ROS needed)"""
+"""Run: python3 src/ur_llm_bridge/ur_llm_bridge/test_bench_lib.py   (no ROS needed)"""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ur_llm_bridge import bench_lib as B
@@ -9,7 +9,8 @@ def P(**kw):
 
 # case table sanity
 ids = [c[0] for c in B.CASES]
-assert len(ids) == len(set(ids)) == 20, len(ids)
+assert len(ids) == len(set(ids)) == 27, len(ids)
+assert "multi_tower_brg" in ids
 
 ev = B.evaluate
 assert ev(("unchanged",), I, I)[0]
@@ -26,6 +27,30 @@ assert ev(("near", "green", "blue"), P(green=(0.6, -0.08, 0.225)), I)[0]
 assert not ev(("near", "green", "blue"), P(green=(0.6, -0.14, 0.225)), I)[0]  # touching/colliding
 assert ev(("reply_has", "red", "blue"), I, I, "I see Red and BLUE")[0]
 assert ev(("all", [("unchanged",), ("reply_has", "red")]), I, I, "red")[0]
+
+# tower blue / red / green (bottom to top) on blue's spot
+spec = [c for c in B.CASES if c[0] == "multi_tower_brg"][0][3]
+assert ev(spec, P(red=(0.6, -0.15, 0.275), green=(0.6, -0.15, 0.325)), I)[0]
+assert not ev(spec, P(red=(0.6, -0.15, 0.275), green=(0.7, 0.12, 0.225)), I)[0]   # green never moved
+
+# zone checks: left pad centre (0.55, 0.28), right (0.55, -0.28); cube must be fully on the pad
+assert ev(("in_zone", "red", "left"), P(red=(0.51, 0.24, 0.225)), I)[0]
+assert not ev(("in_zone", "red", "left"), P(red=(0.51, 0.24, 0.30)), I)[0]          # in the air
+assert not ev(("in_zone", "red", "left"), P(red=(0.51, 0.10, 0.225)), I)[0]         # off the pad
+assert not ev(("in_zone", "red", "left"), P(red=(0.51, -0.24, 0.225)), I)[0]        # wrong zone
+assert ev(("in_zone", "red", "right"), P(red=(0.59, -0.32, 0.225)), I)[0]
+zspec = [c for c in B.CASES if c[0] == "zone_sort3"][0][3]
+assert ev(zspec, P(red=(0.51, 0.24, 0.225), green=(0.59, 0.24, 0.225), blue=(0.51, -0.24, 0.225)), I)[0]
+
+# relational checks: reference blue at (0.6, -0.15); left = +y, right = -y, front = -x (toward robot), behind = +x
+assert ev(("rel", "red", "blue", "left"), P(red=(0.6, -0.05, 0.225)), I)[0]
+assert not ev(("rel", "red", "blue", "left"), P(red=(0.6, -0.25, 0.225)), I)[0]     # that is the right side
+assert not ev(("rel", "red", "blue", "left"), P(red=(0.68, -0.05, 0.225)), I)[0]    # too far off-axis
+assert not ev(("rel", "red", "blue", "left"), P(red=(0.6, -0.12, 0.225)), I)[0]     # touching
+assert ev(("rel", "red", "blue", "right"), P(red=(0.6, -0.25, 0.225)), I)[0]
+assert ev(("rel", "red", "blue", "front"), P(red=(0.5, -0.15, 0.225)), I)[0]
+assert ev(("rel", "red", "blue", "behind"), P(red=(0.7, -0.15, 0.225)), I)[0]
+assert not ev(("rel", "red", "blue", "left"), P(red=(0.6, -0.05, 0.30)), I)[0]      # in the air
 
 # gz protobuf-text fallback parser (zero fields are omitted in this format!)
 txt = '''
