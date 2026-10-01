@@ -1,0 +1,12 @@
+# Place the held object on top of the object with colour `target`.
+# If target is empty, place at (x, y) on a surface of height surface_z
+# (surface_z <= 0 means the table top).
+string target
+float64 x
+float64 y
+float64 surface_z
+---
+bool success
+string message
+---
+string stage

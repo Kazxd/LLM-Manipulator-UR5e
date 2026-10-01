@@ -1,0 +1,7 @@
+# Pick the object of this colour ("red", "green", "blue")
+string color
+---
+bool success
+string message
+---
+string stage
