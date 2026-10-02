@@ -6,6 +6,7 @@ find_package(action_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/DetectObjects.srv"
+  "srv/DetectOpen.srv"
   "action/MoveHome.action"
   "action/Pick.action"
   "action/Place.action"

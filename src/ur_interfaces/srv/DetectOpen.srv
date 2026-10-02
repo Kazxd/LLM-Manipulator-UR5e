@@ -1,0 +1,11 @@
+# Open-vocabulary detection: find objects by free-text labels, e.g. ["yellow can", "purple ball"].
+# threshold <= 0 means "use the node default".
+string[] labels
+float32 threshold
+---
+bool success
+string message
+string[] ids            # "<label>_<k>" with spaces replaced by underscores
+string[] found_labels   # the query label each detection matched
+float32[] scores
+geometry_msgs/PoseStamped[] poses   # frame base_link; position.z is the TOP surface height
