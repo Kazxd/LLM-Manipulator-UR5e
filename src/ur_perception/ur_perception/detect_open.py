@@ -22,6 +22,7 @@ from ur_interfaces.srv import DetectOpen
 CAM_POS = np.array([0.6, 0.0, 1.2])   # must match the world file / detect_objects.py
 TABLE_TOP = 0.20                      # must match the world file
 ABOVE_TABLE = 0.01                    # pixels must be this far above the table to count as object
+MAX_OBJECT_H = 0.18                   # ...and no higher than this (a stack of 3 cubes is 0.15 m); the arm is higher
 MIN_PIX = 15                          # minimum object pixels inside a box
 MIN_FILL = 0.25                       # object pixels / box area; the table box has ~0 and is rejected
 MAX_BOX_FRAC = 0.30                   # of the ROI area; bigger boxes are the table, not an object
@@ -203,7 +204,8 @@ class DetectOpenService(Node):
                 continue
             d = depth[y0:y1, x0:x1].astype(np.float64)
             vs, us = np.mgrid[y0:y1, x0:x1]
-            ok = np.isfinite(d) & (d > 0) & ((CAM_POS[2] - d) > TABLE_TOP + ABOVE_TABLE)
+            zw = CAM_POS[2] - d
+            ok = np.isfinite(d) & (d > 0) & (zw > TABLE_TOP + ABOVE_TABLE) & (zw < TABLE_TOP + MAX_OBJECT_H)
             if ok.sum() < MIN_PIX or ok.sum() < MIN_FILL * d.size:
                 rejected += 1          # empty or mostly table: not an object
                 continue
