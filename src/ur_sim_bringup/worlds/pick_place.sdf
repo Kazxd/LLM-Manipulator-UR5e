@@ -56,7 +56,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -71,7 +71,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -86,7 +86,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -104,7 +104,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><cylinder><radius>0.025</radius><length>0.05</length></cylinder></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><cylinder><radius>0.025</radius><length>0.05</length></cylinder></geometry>
@@ -119,7 +119,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><sphere><radius>0.025</radius></sphere></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><sphere><radius>0.025</radius></sphere></geometry>
@@ -134,7 +134,7 @@
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.04 0.07 0.05</size></box></geometry>
           <surface>
-            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>
           </surface></collision>
         <visual name="v"><geometry><box><size>0.04 0.07 0.05</size></box></geometry>

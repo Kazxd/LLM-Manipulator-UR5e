@@ -1,12 +1,22 @@
 """Action server exposing /move_home, /pick_object, /place_object.
 
-Uses a 'magic gripper': a held object is teleported to follow the tool in Gazebo.
+Gripper modes (-p gripper:=robotiq | magic, default robotiq; must match sim.launch.py gripper:=...):
+  robotiq: Robotiq 2F-85. One joint (robotiq_85_left_knuckle_joint, 0 = open 85 mm, about 0.79 = closed).
+           Closing is a ramp: the command creeps toward closed until the finger stalls on the object, then the command
+           is set to the stalled position plus a small squeeze (-p squeeze:=0.05 rad). That gives a bounded, tunable
+           grip force instead of a full-effort crush. Opening first relaxes the squeeze, then ramps open slowly, and
+           (-p snap_release:=true) finally puts the object at its exact rest pose so it cannot drift away.
+           The fingers open and close along world x (tool pointing down).
+           At the start of every skill the gripper's self-contacts are allowed in MoveIt's collision matrix (acm_fix.py).
+  magic  : a held object is teleported to follow the tool (no fingers).
+Hold modes for robotiq (-p hold:=physics | attach, default physics):
+  physics: the object is carried by finger friction only.
+  attach : after a passed grasp check the object follows the tool by teleport (fallback while tuning physics).
+-p tcp:=0.15  distance from tool0 to the fingertip centre (tune this if the pads grab too high or too low).
 Only one skill runs at a time; a second goal is rejected while busy.
-Services: /reset_state (clear held state, put the extra objects back, go home), /get_status (what is held).
+Services: /reset_state (clear held state, open gripper, put the extra objects back, go home), /get_status.
 
-Objects: the cubes red/green/blue (found by the colour detector) and, when `ros2 run ur_perception detect_open`
-is running, the extra objects can/ball/block (OBJECTS below). Pick/Place accept any of these names
-(Pick.color = "can", Place.target = "block", ...). Cubes are always available; the extra objects need /detect_open.
+Objects: cubes red/green/blue (colour detector) and, when detect_open runs, can/ball/block (OBJECTS below).
 Collision scene: the table, plus every detected object except the held/picked one.
 Disable with  --ros-args -p collision_scene:=false ; ignore /detect_open with  -p open_vocab:=false
 """
@@ -17,31 +27,41 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from tf2_ros import Buffer, TransformListener
+from std_msgs.msg import Float64MultiArray
 from ros_gz_interfaces.srv import SetEntityPose
 from ros_gz_interfaces.msg import Entity
 from pymoveit2 import MoveIt2
 from ur_interfaces.srv import DetectObjects, DetectOpen
 from std_srvs.srv import Trigger
 from ur_interfaces.action import MoveHome, Pick, Place
+from ur_skills.acm_fix import allow_gripper_collisions
 
 JOINTS = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
           "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
 HOME = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
 DOWN = [1.0, 0.0, 0.0, 0.0]      # tool z pointing down (x, y, z, w)
-TCP = 0.15                        # virtual fingertip distance below tool0
-CUBE = 0.05                       # height of EVERY object (cubes and extras are all 5 cm tall)
+TCP_DEFAULT = 0.15                # tool0 to fingertip centre (parameter tcp overrides)
+CUBE = 0.05                       # height of EVERY object
 APPROACH = 0.12                   # hover height above grasp/place
 TABLE_TOP = 0.20                  # must match the world file
 SHOULDER_Z = 0.163                # UR5e shoulder height
 REACH = 0.92                      # loose sanity gate only; MoveIt is the real judge
-RELEASE_CLEARANCE = 0.005         # lower the object with 5 mm to spare, never start interpenetrating
+RELEASE_CLEARANCE = 0.005
 CUBE_MARGIN = 0.01                # collision boxes are inflated by this (total, all axes)
 COLORS = ("red", "green", "blue")
 IDENT_QUAT = (0.0, 0.0, 0.0, 1.0)
 
-# Extra objects: key -> (gazebo model, label sent to /detect_open, box size x,y,z for the collision scene).
-# Labels describe how the object LOOKS from the overhead camera (a can is a circle). Keep in sync with the SDF
-# and with detect_open_check.py.
+# Robotiq knuckle joint (radians). Calibrate GRIP_MIN_Q and GRIP_MISS_Q from the logged "fingers closed: q=" values.
+GRIP_OPEN = 0.0
+GRIP_CLOSED = 0.79                # the closing ramp ends here if nothing is between the fingers
+GRIP_MISS_Q = 0.70                # at or above this the fingers closed on nothing
+GRIP_MIN_Q = 0.10                 # below this the fingers did not close (blocked or not commanded)
+CLOSE_RATE = 0.4                  # rad/s command ramp (the joint velocity limit is 0.5)
+OPEN_RATE = 0.3                   # rad/s, slow so the finger pads do not drag the object
+STALL_LAG = 0.06                  # command ahead of the joint by more than this and not moving means stalled on an object
+FINGER_JOINTS = ("robotiq_85_left_knuckle_joint",)
+GRIPPER_TOPIC = "/gripper_controller/commands"
+
 OBJECTS = {
     "can":   ("yellow_can",  "yellow circle", (0.05, 0.05, 0.05)),
     "ball":  ("purple_ball", "purple ball",   (0.05, 0.05, 0.05)),
@@ -49,9 +69,9 @@ OBJECTS = {
 }
 OBJECT_START = {"yellow_can": (0.72, -0.30, 0.225), "purple_ball": (0.38, 0.34, 0.225),
                 "white_block": (0.80, 0.00, 0.225)}
-NOT_STACKABLE = ("ball",)         # cannot be a place-on-top target
+NOT_STACKABLE = ("ball",)
 ALL_NAMES = COLORS + tuple(OBJECTS)
-DUP_RADIUS = 0.04                 # an open-vocab box this close to a colour-detected cube is that cube, not an object
+DUP_RADIUS = 0.04
 
 
 def canon(name):
@@ -85,6 +105,18 @@ class SkillServer(Node):
     def __init__(self):
         super().__init__("skill_server", parameter_overrides=[Parameter("use_sim_time", value=True)])
         self.cb = ReentrantCallbackGroup()
+        self.gripper = str(self.declare_parameter("gripper", "robotiq").value).lower()
+        if self.gripper not in ("robotiq", "magic"):
+            self.get_logger().warn(f"unknown gripper '{self.gripper}', using 'robotiq'")
+            self.gripper = "robotiq"
+        self.hold = str(self.declare_parameter("hold", "physics").value).lower()
+        if self.hold not in ("attach", "physics"):
+            self.get_logger().warn(f"unknown hold '{self.hold}', using 'physics'")
+            self.hold = "physics"
+        self.tcp = float(self.declare_parameter("tcp", TCP_DEFAULT).value)
+        self.squeeze = float(self.declare_parameter("squeeze", 0.05).value)
+        self.snap_release = bool(self.declare_parameter("snap_release", True).value)
+        self.grasp_check = self.declare_parameter("grasp_check", True).value
         self.moveit2 = MoveIt2(node=self, joint_names=JOINTS, base_link_name="base_link",
                                end_effector_name="tool0", group_name="ur_manipulator",
                                callback_group=self.cb)
@@ -98,6 +130,7 @@ class SkillServer(Node):
         self.detect_cli = self.create_client(DetectObjects, "/detect_objects", callback_group=self.cb)
         self.open_cli = self.create_client(DetectOpen, "/detect_open", callback_group=self.cb)
         self.pose_cli = self.create_client(SetEntityPose, "/world/pick_place/set_pose", callback_group=self.cb)
+        self.grip_pub = self.create_publisher(Float64MultiArray, GRIPPER_TOPIC, 10)
         self.tf_buf = Buffer()
         self.tf_listener = TransformListener(self.tf_buf, self)
         self.held = None                 # gazebo model name of the held object
@@ -106,11 +139,11 @@ class SkillServer(Node):
         self.pose_future = None
         self.active = False
         self.lock = threading.Lock()
-        self.open_note = ""              # why the extra objects were not detected (for failure messages)
-        self.scene_boxes = {}            # name -> (x, y, top_z) of the object boxes currently in the MoveIt scene
+        self.open_note = ""
+        self.scene_boxes = {}
+        self.acm_ok = None               # last result of the gripper collision-matrix update (for logging only)
         self.collision_scene = self.declare_parameter("collision_scene", True).value
         self.open_vocab = self.declare_parameter("open_vocab", True).value
-        # debugging aid: if a motion fails, remove all object boxes and retry once (hides real collisions!)
         self.retry_no_boxes = self.declare_parameter("retry_no_boxes", False).value
         self.create_timer(0.03, self.follow_tool, callback_group=self.cb)
 
@@ -126,7 +159,22 @@ class SkillServer(Node):
         self.create_service(Trigger, "get_status", self.on_status, callback_group=self.cb)
         self.get_logger().info(
             f"skill server ready: /move_home /pick_object /place_object /reset_state /get_status "
-            f"(collision_scene={self.collision_scene}, open_vocab={self.open_vocab}, names={ALL_NAMES})")
+            f"(gripper={self.gripper}, hold={self.hold}, tcp={self.tcp}, squeeze={self.squeeze}, "
+            f"snap_release={self.snap_release}, collision_scene={self.collision_scene}, "
+            f"open_vocab={self.open_vocab}, names={ALL_NAMES})")
+
+    def teleport_hold(self):
+        """True when the held object is carried by teleporting it with the tool."""
+        return self.gripper == "magic" or self.hold == "attach"
+
+    def ensure_gripper_acm(self):
+        """Allow the gripper's own contacts in MoveIt (cheap; repeated every skill so a move_group restart is covered)."""
+        if self.gripper != "robotiq":
+            return
+        ok, msg = allow_gripper_collisions(self, self.wait, self.cb)
+        if ok != self.acm_ok:
+            (self.get_logger().info if ok else self.get_logger().warn)(f"collision matrix: {msg}")
+        self.acm_ok = ok
 
     # ---------- action plumbing ----------
     def on_goal(self, goal):
@@ -137,7 +185,6 @@ class SkillServer(Node):
             return GoalResponse.ACCEPT
 
     def on_reset(self, req, res):
-        """Forget any held object, put the extra objects back, go home (benchmark / manual recovery)."""
         with self.lock:
             if self.active:
                 res.success, res.message = False, "a skill is running"
@@ -146,6 +193,7 @@ class SkillServer(Node):
         try:
             with self.held_lock:
                 self.held = self.held_key = None
+            self.open_gripper()
             for model, (x, y, z) in OBJECT_START.items():
                 self.wait(self._send_pose(model, x, y, z), 3.0)
             self.add_table()
@@ -189,7 +237,90 @@ class SkillServer(Node):
         self.get_logger().info(f"result: {ok} - {msg}")
         return res
 
-    # ---------- magic gripper ----------
+    # ---------- gripper ----------
+    def finger_q(self):
+        """Knuckle joint position from joint states, or None."""
+        try:
+            js = self.moveit2.joint_state
+            d = dict(zip(js.name, js.position))
+            vals = [d[j] for j in FINGER_JOINTS if j in d]
+            return sum(vals) / len(vals) if vals else None
+        except Exception:
+            return None
+
+    def send_grip(self, q, repeat=1):
+        msg = Float64MultiArray()
+        msg.data = [float(q)]
+        for _ in range(repeat):
+            self.grip_pub.publish(msg)
+            if repeat > 1:
+                time.sleep(0.03)
+
+    def ramp_gripper(self, target, rate, dt=0.1):
+        """Move the command to target at `rate` rad/s starting from the current joint position, then settle."""
+        if self.gripper != "robotiq":
+            return
+        q = self.finger_q()
+        if q is None:
+            self.send_grip(target, repeat=3)
+            time.sleep(2.0)
+            return
+        cmd = q
+        while abs(target - cmd) > 1e-3:
+            step = rate * dt
+            cmd = min(target, cmd + step) if target > cmd else max(target, cmd - step)
+            self.send_grip(cmd)
+            time.sleep(dt)
+        self.send_grip(target, repeat=3)
+        time.sleep(0.5)
+
+    def open_gripper(self, wait=None):
+        """Open slowly (wait is kept only for old call sites)."""
+        self.ramp_gripper(GRIP_OPEN, OPEN_RATE)
+
+    def close_gripper(self):
+        """Ramp closed until the finger stalls on the object, then hold with a bounded squeeze. Returns (ok, message)."""
+        if self.gripper != "robotiq":
+            return True, ""
+        q0 = self.finger_q()
+        cmd = q0 if q0 is not None else 0.0
+        dt, last, still, stalled = 0.1, None, 0, False
+        while cmd < GRIP_CLOSED - 1e-3:
+            cmd = min(GRIP_CLOSED, cmd + CLOSE_RATE * dt)
+            self.send_grip(cmd)
+            time.sleep(dt)
+            q = self.finger_q()
+            if q is None:
+                continue
+            if cmd - q > STALL_LAG:
+                still = still + 1 if (last is not None and abs(q - last) < 0.002) else 0
+                if still >= 3:
+                    stalled = True
+                    break
+            last = q
+        q = self.finger_q()
+        if stalled and q is not None:
+            hold = min(GRIP_CLOSED, q + self.squeeze)
+            self.send_grip(hold, repeat=3)          # bounded squeeze: force is about gain times (hold - q)
+            time.sleep(0.6)
+            q = self.finger_q()
+            self.get_logger().info(f"stalled on an object at q={q}, holding command {hold:.3f} (squeeze {self.squeeze})")
+        else:
+            self.send_grip(GRIP_CLOSED, repeat=3)
+            time.sleep(0.5)
+            q = self.finger_q()
+        self.get_logger().info(f"fingers closed: q={q}  (miss >= {GRIP_MISS_Q}, too open < {GRIP_MIN_Q})")
+        if not self.grasp_check:
+            return True, ""
+        if q is None:
+            return False, "grasp check failed: no gripper joint state (is gripper_controller active?)"
+        if q >= GRIP_MISS_Q:
+            return False, f"grasp missed: fingers closed fully (q={q:.3f}), nothing between them"
+        if q < GRIP_MIN_Q:
+            return False, f"grasp failed: fingers did not close (q={q:.3f}), something blocks them"
+        return True, ""
+
+    # ---------- teleport carrying ----------
     def _send_pose(self, name, x, y, z):
         req = SetEntityPose.Request()
         req.entity.name, req.entity.type = name, Entity.MODEL
@@ -198,24 +329,39 @@ class SkillServer(Node):
         return self.pose_cli.call_async(req)
 
     def follow_tool(self):
+        if not self.teleport_hold():
+            return
         with self.held_lock:
             if not self.held:
                 return
             if self.pose_future is not None and not self.pose_future.done():
-                return                      # previous teleport still in flight: don't pile up
+                return
             try:
                 t = self.tf_buf.lookup_transform("base_link", "tool0", rclpy.time.Time()).transform.translation
             except Exception:
                 return
-            self.pose_future = self._send_pose(self.held, t.x, t.y, t.z - TCP)
+            self.pose_future = self._send_pose(self.held, t.x, t.y, t.z - self.tcp)
 
     def release_cube(self, x, y, z):
-        """Stop following, let any in-flight teleport finish, then put the object at its exact rest pose."""
+        """Teleport modes: put the object at its exact rest pose, then open. Physics: relax the squeeze, open slowly,
+        then (snap_release) put the object at its exact rest pose so it cannot drift off."""
         with self.held_lock:
             name, self.held, self.held_key = self.held, None, None
-        if self.pose_future is not None:
-            self.wait(self.pose_future, 2.0)
-        if name:
+        if self.teleport_hold():
+            if self.pose_future is not None:
+                self.wait(self.pose_future, 2.0)
+            if name:
+                self.wait(self._send_pose(name, x, y, z), 2.0)
+            if self.gripper == "robotiq":
+                self.open_gripper()
+            return
+        if self.gripper == "robotiq":
+            q = self.finger_q()
+            if q is not None:
+                self.send_grip(q, repeat=3)         # command = actual position: grip force drops to about zero
+                time.sleep(0.4)
+            self.open_gripper()
+        if name and self.snap_release:
             self.wait(self._send_pose(name, x, y, z), 2.0)
 
     # ---------- helpers ----------
@@ -226,8 +372,6 @@ class SkillServer(Node):
         return fut.result() if fut.done() else None
 
     def locate_all(self, need=()):
-        """{name: (x, y, top_z)} for every visible cube (colour detector) and, if /detect_open is running,
-        for the extra objects. `need` lists names the caller must have; it only changes the failure note."""
         req = DetectObjects.Request(); req.color = "all"
         res = self.wait(self.detect_cli.call_async(req))
         out = {}
@@ -244,21 +388,20 @@ class SkillServer(Node):
             if wants_extra:
                 self.open_note = " (/detect_open is not running: ros2 run ur_perception detect_open)"
             return out
-        # object labels + the cube labels, so that cubes are claimed by their own label instead of a weak object label
         q = DetectOpen.Request()
         q.labels = [v[1] for v in OBJECTS.values()] + [f"{c} cube" for c in COLORS]
-        r = self.wait(self.open_cli.call_async(q), 120.0)     # the first call loads the model
+        r = self.wait(self.open_cli.call_async(q), 120.0)
         if r is None:
             self.open_note = " (/detect_open timed out)"
             return out
         by_label = {v[1]: k for k, v in OBJECTS.items()}
-        for lab, p in zip(r.found_labels, r.poses):           # best score first
+        for lab, p in zip(r.found_labels, r.poses):
             key = by_label.get(lab)
             if key is None or key in out:
                 continue
             x, y = p.pose.position.x, p.pose.position.y
             if any(math.hypot(x - cx, y - cy) < DUP_RADIUS for n, (cx, cy, _) in out.items() if n in COLORS):
-                continue                                       # that is a cube, not an extra object
+                continue
             top = p.pose.position.z
             if not (TABLE_TOP + 0.02 < top < TABLE_TOP + 3 * CUBE + 0.03):
                 self.get_logger().warn(f"ignoring '{lab}' at ({x:.2f}, {y:.2f}): top z {top:.2f} m is not table level "
@@ -270,6 +413,8 @@ class SkillServer(Node):
         return out
 
     def add_table(self):
+        """Runs at the start of every skill: also refreshes the gripper collision exceptions."""
+        self.ensure_gripper_acm()
         if not self.collision_scene:
             return
         try:
@@ -279,7 +424,6 @@ class SkillServer(Node):
             self.get_logger().warn(f"could not add table to the collision scene: {e}")
 
     def sync_cubes(self, objs, exclude=()):
-        """All detected objects as obstacles, except the held one and the `exclude` names. Stale boxes are removed first."""
         if not self.collision_scene:
             return
         held = self.held_key
@@ -296,12 +440,11 @@ class SkillServer(Node):
                                                position=(x, y, top - sz / 2),
                                                quat_xyzw=IDENT_QUAT, frame_id="base_link")
                 self.scene_boxes[n] = (x, y, top)
-            time.sleep(0.3)            # scene updates are published asynchronously
+            time.sleep(0.3)
         except Exception as e:
             self.get_logger().warn(f"could not update objects in the collision scene: {e}")
 
     def z_hint(self, top):
-        """Explain a suspicious detected height (usually an outdated world file)."""
         expected = TABLE_TOP + CUBE
         if abs(top - expected) > 0.05:
             return (f" [detected top z={top:.2f} m but expected about {expected:.2f} m: "
@@ -309,7 +452,6 @@ class SkillServer(Node):
         return ""
 
     def fail_report(self, xyz, cartesian):
-        """What to look at when a motion fails: the goal, every box in the scene and its xy distance from the goal."""
         boxes = ", ".join(f"{n} xy=({bx:.2f},{by:.2f}) top={t:.2f} d_xy={math.hypot(bx - xyz[0], by - xyz[1]):.2f}"
                           for n, (bx, by, t) in self.scene_boxes.items()) or "none"
         return (f"motion to ({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}) cartesian={cartesian} failed. "
@@ -320,7 +462,7 @@ class SkillServer(Node):
             self.moveit2.move_to_pose(position=list(xyz), quat_xyzw=DOWN, cartesian=cartesian)
             if self.moveit2.wait_until_executed():
                 if attempt == 2:
-                    self.get_logger().warn("motion worked only WITHOUT object boxes: one of them blocks it (see the report above)")
+                    self.get_logger().warn("motion worked only WITHOUT object boxes: one of them blocks it")
                 return True
             self.get_logger().warn(self.fail_report(xyz, cartesian))
             if attempt == 1 and self.retry_no_boxes and self.scene_boxes:
@@ -331,7 +473,6 @@ class SkillServer(Node):
         return False
 
     def clear_objects(self):
-        """Remove every object box (not the table) from the MoveIt scene."""
         if not self.collision_scene:
             return
         try:
@@ -343,7 +484,6 @@ class SkillServer(Node):
             self.get_logger().warn(f"could not clear object boxes: {e}")
 
     def state_report(self):
-        """One line about the arm's joint state, to tell stale/paused-sim problems from collision problems."""
         try:
             js = self.moveit2.joint_state
             age = (self.get_clock().now() - rclpy.time.Time.from_msg(js.header.stamp)).nanoseconds / 1e9
@@ -359,8 +499,7 @@ class SkillServer(Node):
                 return True
             self.get_logger().warn(f"homing failed (attempt {attempt}): {self.state_report()}")
             if attempt == 1:
-                self.get_logger().warn("retrying home with all object boxes removed "
-                                       "(if this works, an object box was the problem)")
+                self.get_logger().warn("retrying home with all object boxes removed")
                 self.clear_objects()
         return False
 
@@ -378,6 +517,7 @@ class SkillServer(Node):
         if self.held_key:
             return False, f"already holding {self.held_key}; place it first"
         self.add_table()
+        self.open_gripper()
         if not self.stage(gh, "moving home"): return False, "cancelled"
         if not self.home(): return False, "failed to move home"
         if not self.stage(gh, f"detecting {name}"): return False, "cancelled"
@@ -388,7 +528,7 @@ class SkillServer(Node):
         x, y, top = objs[name]
         self.get_logger().info(f"{name} detected at ({x:.3f}, {y:.3f}), top z={top:.3f}")
         hint = self.z_hint(top)
-        grasp_z = (top - CUBE / 2) + TCP
+        grasp_z = (top - CUBE / 2) + self.tcp
         pre_z = grasp_z + APPROACH
         if not reachable(x, y, pre_z):
             return False, (f"{name} object at ({x:.2f},{y:.2f}) is out of the arm's reach "
@@ -398,11 +538,26 @@ class SkillServer(Node):
         for text, xyz, cart in steps:
             if not self.stage(gh, text): return False, "cancelled"
             if not self.go(xyz, cart): return False, f"motion failed while {text}"
+        if self.gripper == "robotiq":
+            if not self.stage(gh, "closing gripper"): return False, "cancelled"
+            ok, why = self.close_gripper()
+            if not ok:
+                self.open_gripper()
+                self.go([x, y, pre_z], True)
+                return False, why
         with self.held_lock:
             self.held, self.held_key = model_of(name), name
-        time.sleep(0.5)
+        time.sleep(0.3)
         if not self.stage(gh, "lifting"): return False, "cancelled"
         if not self.go([x, y, pre_z], True): return False, "motion failed while lifting"
+        if self.gripper == "robotiq" and self.grasp_check and not self.teleport_hold():
+            q = self.finger_q()
+            self.get_logger().info(f"after lift: q={q}")
+            if q is not None and q >= GRIP_MISS_Q:
+                with self.held_lock:
+                    self.held = self.held_key = None
+                self.open_gripper()
+                return False, f"object slipped out of the gripper during the lift (q={q:.3f})"
         return True, f"picked {name} object"
 
     def do_place(self, gh):
@@ -434,7 +589,7 @@ class SkillServer(Node):
         else:
             x, y = r.x, r.y
             surface = r.surface_z if r.surface_z > 0 else TABLE_TOP
-        place_z = (surface + CUBE / 2) + TCP + RELEASE_CLEARANCE
+        place_z = (surface + CUBE / 2) + self.tcp + RELEASE_CLEARANCE
         pre_z = place_z + APPROACH
         if not reachable(x, y, pre_z):
             return False, (f"place position ({x:.2f},{y:.2f}) is out of the arm's reach "
@@ -444,8 +599,9 @@ class SkillServer(Node):
         for text, xyz, cart in steps:
             if not self.stage(gh, text): return False, "cancelled"
             if not self.go(xyz, cart): return False, f"motion failed while {text}"
-        self.release_cube(x, y, surface + CUBE / 2 + 0.002)   # exact rest pose, no drop
-        time.sleep(0.5)
+        if self.gripper == "robotiq" and not self.stage(gh, "releasing"): return False, "cancelled"
+        self.release_cube(x, y, surface + CUBE / 2 + 0.002)
+        time.sleep(0.3)
         if not self.stage(gh, "retreating"): return False, "cancelled"
         if not self.go([x, y, pre_z], True): return False, "placed, but retreat failed"
         return True, "placed"

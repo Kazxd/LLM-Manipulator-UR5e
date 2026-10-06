@@ -1,20 +1,54 @@
 import os
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
-    world = os.path.join(get_package_share_directory("ur_sim_bringup"), "worlds", "pick_place.sdf")
+    share = get_package_share_directory("ur_sim_bringup")
+    world = os.path.join(share, "worlds", "pick_place.sdf")
+    ur_launch = os.path.join(get_package_share_directory("ur_simulation_gz"), "launch", "ur_sim_moveit.launch.py")
 
-    # NOTE: verify the world argument name with:
-    #   ros2 launch ur_simulation_gz ur_sim_moveit.launch.py --show-args | grep -i world
-    ur_sim = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory("ur_simulation_gz"), "launch", "ur_sim_moveit.launch.py")),
+    # gripper:=robotiq (default) -> arm + Robotiq 2F-85;  gripper:=magic -> bare arm, objects teleported.
+    # skill_server must use the same choice (-p gripper:=magic|robotiq, default robotiq).
+    gripper = LaunchConfiguration("gripper")
+    is_robotiq = IfCondition(PythonExpression(["'", gripper, "' == 'robotiq'"]))
+    is_magic = IfCondition(PythonExpression(["'", gripper, "' == 'magic'"]))
+
+    # Gazebo resolves package://robotiq_description/... through this path (parent of the package share directory)
+    try:
+        rq_parent = os.path.dirname(get_package_share_directory("robotiq_description"))
+    except Exception:
+        rq_parent = ""
+    resource_path = AppendEnvironmentVariable("GZ_SIM_RESOURCE_PATH", rq_parent)
+
+    ur_magic = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(ur_launch),
         launch_arguments={"ur_type": "ur5e", "world_file": world}.items(),
+        condition=is_magic,
+    )
+    ur_robotiq = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(ur_launch),
+        launch_arguments={
+            "ur_type": "ur5e", "world_file": world,
+            "description_file": os.path.join(share, "urdf", "ur_gz_gripper.urdf.xacro"),
+            "controllers_file": os.path.join(share, "config", "ur_gripper_controllers.yaml"),
+            "moveit_launch_file": os.path.join(share, "launch", "ur_moveit_robotiq.launch.py"),
+        }.items(),
+        condition=is_robotiq,
+    )
+
+    # waits for the controller manager, then loads the gripper controller
+    gripper_spawner = Node(
+        package="controller_manager", executable="spawner",
+        arguments=["gripper_controller", "--controller-manager", "/controller_manager",
+                   "--controller-manager-timeout", "120"],
+        parameters=[{"use_sim_time": True}],
+        condition=is_robotiq,
     )
 
     cam_bridge = Node(
@@ -46,4 +80,7 @@ def generate_launch_description():
         parameters=[{"use_sim_time": True}],
     )
 
-    return LaunchDescription([ur_sim, cam_bridge, pose_bridge, pose_gt_bridge, cam_tf])
+    return LaunchDescription([
+        DeclareLaunchArgument("gripper", default_value="robotiq", description="robotiq | magic"),
+        resource_path, ur_magic, ur_robotiq, gripper_spawner, cam_bridge, pose_bridge, pose_gt_bridge, cam_tf,
+    ])

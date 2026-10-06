@@ -180,6 +180,11 @@ class LLMBridge(Node):
         if name == "move_home":
             ok, msg = self.call_action(self.home_cli, MoveHome.Goal())
         elif name == "pick_object":
+            # Benchmark showed the model re-picking a cube it already holds (a wasted failed call).
+            # Asking for the cube that is already in the gripper is a harmless no-op.
+            if self.get_holding() == a["color"]:
+                self.holding = a["color"]
+                return {"success": True, "message": f"already holding {a['color']}; nothing to do"}
             g = Pick.Goal(); g.color = a["color"]
             ok, msg = self.call_action(self.pick_cli, g)
             if ok:
