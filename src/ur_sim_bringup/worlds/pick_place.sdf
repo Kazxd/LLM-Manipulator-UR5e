@@ -48,10 +48,12 @@
           <material><diffuse>0.85 0.85 0.85 1</diffuse></material></visual>
       </link>
     </model>
+    <!-- All movable objects have gravity ON so they rest on the table or on each other and a disturbance dies out
+         through friction. Heavy damping (velocity_decay) keeps knocks small. -->
     <model name="red_cube">
       <pose>0.5 0.1 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -66,7 +68,7 @@
     <model name="blue_cube">
       <pose>0.6 -0.15 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -81,7 +83,7 @@
     <model name="green_cube">
       <pose>0.7 0.12 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.05 0.05 0.05</size></box></geometry>
@@ -99,7 +101,7 @@
     <model name="yellow_can">
       <pose>0.72 -0.30 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><cylinder><radius>0.025</radius><length>0.05</length></cylinder></geometry>
@@ -114,7 +116,7 @@
     <model name="purple_ball">
       <pose>0.38 0.34 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><sphere><radius>0.025</radius></sphere></geometry>
@@ -129,7 +131,7 @@
     <model name="white_block">
       <pose>0.80 0.00 0.225 0 0 0</pose>
       <link name="link">
-        <gravity>false</gravity>
+        <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
         <collision name="c"><geometry><box><size>0.04 0.07 0.05</size></box></geometry>

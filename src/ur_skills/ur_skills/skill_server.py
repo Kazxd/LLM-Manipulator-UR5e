@@ -3,9 +3,13 @@
 Gripper modes (-p gripper:=robotiq | magic, default robotiq; must match sim.launch.py gripper:=...):
   robotiq: Robotiq 2F-85. One joint (robotiq_85_left_knuckle_joint, 0 = open 85 mm, about 0.79 = closed).
            Closing is a ramp: the command creeps toward closed until the finger stalls on the object, then the command
-           is set to the stalled position plus a small squeeze (-p squeeze:=0.05 rad). That gives a bounded, tunable
+           is set to the stalled position plus a small squeeze (-p squeeze:=0.08 rad). That gives a bounded, tunable
            grip force instead of a full-effort crush. Opening first relaxes the squeeze, then ramps open slowly, and
-           (-p snap_release:=true) finally puts the object at its exact rest pose so it cannot drift away.
+           (-p snap_release:=true, default FALSE) would teleport the object to its exact rest pose: that fakes placement
+           accuracy, so never use it for benchmarks.
+           Objects have gravity ON in the world file, so a released object rests on the table / the cube below.
+           Dropped objects are detected from the finger joint: if the fingers move further closed than they were when
+           the grasp stalled (-p slip_tol:=0.025 rad) the object is lost, the skill fails and nothing is teleported.
            The fingers open and close along world x (tool pointing down).
            At the start of every skill the gripper's self-contacts are allowed in MoveIt's collision matrix (acm_fix.py).
   magic  : a held object is teleported to follow the tool (no fingers).
@@ -27,7 +31,9 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from tf2_ros import Buffer, TransformListener
+from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Float64MultiArray
+from tf2_msgs.msg import TFMessage
 from ros_gz_interfaces.srv import SetEntityPose
 from ros_gz_interfaces.msg import Entity
 from pymoveit2 import MoveIt2
@@ -114,8 +120,13 @@ class SkillServer(Node):
             self.get_logger().warn(f"unknown hold '{self.hold}', using 'physics'")
             self.hold = "physics"
         self.tcp = float(self.declare_parameter("tcp", TCP_DEFAULT).value)
-        self.squeeze = float(self.declare_parameter("squeeze", 0.05).value)
-        self.snap_release = bool(self.declare_parameter("snap_release", True).value)
+        self.squeeze = float(self.declare_parameter("squeeze", 0.08).value)
+        self.cur_squeeze = self.squeeze   # squeeze used by the current grasp attempt (escalates on retries)
+        self.grasp_retries = int(self.declare_parameter("grasp_retries", 2).value)   # extra attempts after a lost grasp
+        self.snap_release = bool(self.declare_parameter("snap_release", False).value)   # teleports the object: keep OFF for honest tests
+        self.slip_tol = float(self.declare_parameter("slip_tol", 0.025).value)
+        self.grasp_dz = float(self.declare_parameter("grasp_dz", -0.0075).value)   # grasp height offset (m), + = higher; -0.0075 won the grasp_sweep (9/9)
+        self.diag_on = bool(self.declare_parameter("diag", True).value)
         self.grasp_check = self.declare_parameter("grasp_check", True).value
         self.moveit2 = MoveIt2(node=self, joint_names=JOINTS, base_link_name="base_link",
                                end_effector_name="tool0", group_name="ur_manipulator",
@@ -137,6 +148,11 @@ class SkillServer(Node):
         self.held_key = None             # its short name: 'red', 'can', ...
         self.held_lock = threading.Lock()
         self.pose_future = None
+        self.grip_q = None               # finger joint position when the grasp stalled on the object
+        self.gt = {}                     # ground-truth model positions from Gazebo (diagnostics only)
+        if self.diag_on:
+            self.create_subscription(TFMessage, "/world/pick_place/pose/info", self.on_gt, 10,
+                                     callback_group=self.cb)
         self.active = False
         self.lock = threading.Lock()
         self.open_note = ""
@@ -145,6 +161,7 @@ class SkillServer(Node):
         self.collision_scene = self.declare_parameter("collision_scene", True).value
         self.open_vocab = self.declare_parameter("open_vocab", True).value
         self.retry_no_boxes = self.declare_parameter("retry_no_boxes", False).value
+        self.add_on_set_parameters_callback(self.on_params)
         self.create_timer(0.03, self.follow_tool, callback_group=self.cb)
 
         for cls, name, fn in ((MoveHome, "move_home", self.do_home),
@@ -157,11 +174,29 @@ class SkillServer(Node):
                          callback_group=self.cb)
         self.create_service(Trigger, "reset_state", self.on_reset, callback_group=self.cb)
         self.create_service(Trigger, "get_status", self.on_status, callback_group=self.cb)
+        if self.teleport_hold() or self.snap_release:
+            self.get_logger().warn("TELEPORTING IS ON (magic gripper, hold:=attach or snap_release:=true): "
+                                   "placements are faked, do NOT trust benchmark results in this mode")
         self.get_logger().info(
             f"skill server ready: /move_home /pick_object /place_object /reset_state /get_status "
             f"(gripper={self.gripper}, hold={self.hold}, tcp={self.tcp}, squeeze={self.squeeze}, "
-            f"snap_release={self.snap_release}, collision_scene={self.collision_scene}, "
-            f"open_vocab={self.open_vocab}, names={ALL_NAMES})")
+            f"snap_release={self.snap_release}, slip_tol={self.slip_tol}, grasp_dz={self.grasp_dz}, diag={self.diag_on}, "
+            f"collision_scene={self.collision_scene}, open_vocab={self.open_vocab}, names={ALL_NAMES})")
+
+    def on_params(self, params):
+        """Live tuning: ros2 param set /skill_server grasp_dz 0.005 (used by grasp_sweep)."""
+        for p in params:
+            try:
+                if p.name == "grasp_dz": self.grasp_dz = float(p.value)
+                elif p.name == "squeeze": self.squeeze = self.cur_squeeze = float(p.value)
+                elif p.name == "tcp": self.tcp = float(p.value)
+                elif p.name == "slip_tol": self.slip_tol = float(p.value)
+                elif p.name == "grasp_retries": self.grasp_retries = int(p.value)
+                else: continue
+                self.get_logger().info(f"parameter {p.name} = {p.value}")
+            except (TypeError, ValueError) as e:
+                return SetParametersResult(successful=False, reason=str(e))
+        return SetParametersResult(successful=True)
 
     def teleport_hold(self):
         """True when the held object is carried by teleporting it with the tool."""
@@ -193,6 +228,7 @@ class SkillServer(Node):
         try:
             with self.held_lock:
                 self.held = self.held_key = None
+            self.grip_q = None
             self.open_gripper()
             for model, (x, y, z) in OBJECT_START.items():
                 self.wait(self._send_pose(model, x, y, z), 3.0)
@@ -293,19 +329,25 @@ class SkillServer(Node):
             if q is None:
                 continue
             if cmd - q > STALL_LAG:
-                still = still + 1 if (last is not None and abs(q - last) < 0.002) else 0
-                if still >= 3:
+                still = still + 1 if (last is not None and abs(q - last) < 0.005) else 0
+                if still >= 2:
                     stalled = True
                     break
             last = q
         q = self.finger_q()
+        if not stalled and q is not None and q < GRIP_MISS_Q - 0.05:
+            stalled = True                           # ramp ended but the fingers are blocked: an object IS there
+            self.get_logger().warn(f"stall not detected during the ramp, but the fingers are blocked at q={q:.3f}; "
+                                   f"treating it as a stall (never command a full close on an object)")
         if stalled and q is not None:
-            hold = min(GRIP_CLOSED, q + self.squeeze)
+            hold = min(GRIP_CLOSED, q + self.cur_squeeze)
             self.send_grip(hold, repeat=3)          # bounded squeeze: force is about gain times (hold - q)
             time.sleep(0.6)
             q = self.finger_q()
-            self.get_logger().info(f"stalled on an object at q={q}, holding command {hold:.3f} (squeeze {self.squeeze})")
+            self.grip_q = q
+            self.get_logger().info(f"stalled on an object at q={q}, holding command {hold:.3f} (squeeze {self.cur_squeeze:.3f})")
         else:
+            self.grip_q = None
             self.send_grip(GRIP_CLOSED, repeat=3)
             time.sleep(0.5)
             q = self.finger_q()
@@ -342,15 +384,71 @@ class SkillServer(Node):
                 return
             self.pose_future = self._send_pose(self.held, t.x, t.y, t.z - self.tcp)
 
+    def on_gt(self, msg):
+        names = {model_of(n) for n in ALL_NAMES}
+        for t in msg.transforms:
+            base = t.child_frame_id.split("::")[0].split("/")[-1]
+            if base in names:
+                tr = t.transform.translation
+                self.gt[base] = (tr.x, tr.y, tr.z)
+
+    def diag(self, tag, name):
+        """Log where the object is relative to the fingertip centre (ground truth, sim only) and the finger q.
+        dx/dy/dz = object centre minus fingertip centre; with a good grasp all three stay near 0 during the lift."""
+        if not self.diag_on:
+            return
+        try:
+            t = self.tf_buf.lookup_transform("base_link", "tool0", rclpy.time.Time()).transform.translation
+            o = self.gt.get(model_of(name))
+            if o is None:
+                self.get_logger().info(f"[diag {tag}] no ground-truth pose for {name} (is the pose bridge running?)")
+                return
+            self.get_logger().info(
+                f"[diag {tag}] object-fingertip dx={o[0] - t.x:+.3f} dy={o[1] - t.y:+.3f} "
+                f"dz={o[2] - (t.z - self.tcp):+.3f}  object z={o[2]:.3f}  q={self.finger_q()}")
+        except Exception as e:
+            self.get_logger().info(f"[diag {tag}] unavailable ({e})")
+
+    def grip_lost(self):
+        """(True, why) if the object is no longer between the fingers. With an object the fingers stay near the stalled
+        position; with nothing between them they close on to the commanded squeeze position."""
+        if self.gripper != "robotiq" or self.teleport_hold() or not self.grasp_check or self.grip_q is None:
+            return False, ""
+        q = self.finger_q()
+        if q is None:
+            return False, ""
+        if q - self.grip_q > self.slip_tol:
+            return True, f"fingers closed further (q={q:.3f}, was {self.grip_q:.3f} when the grasp stalled)"
+        if q < GRIP_MIN_Q:
+            return True, f"fingers opened (q={q:.3f})"
+        return False, ""
+
+    def check_grip(self, where):
+        """None if the object is still held; otherwise clear the held state, open the gripper and return a message."""
+        lost, why = self.grip_lost()
+        if lost:
+            time.sleep(0.3)                      # ignore a momentary wobble: it must still look lost
+            lost, why = self.grip_lost()
+        if not lost:
+            return None
+        self.get_logger().warn(f"object lost {where}: {why}")
+        with self.held_lock:
+            self.held = self.held_key = None
+        self.grip_q = None
+        self.open_gripper()
+        return f"lost the object {where} ({why})"
+
     def release_cube(self, x, y, z):
         """Teleport modes: put the object at its exact rest pose, then open. Physics: relax the squeeze, open slowly,
         then (snap_release) put the object at its exact rest pose so it cannot drift off."""
         with self.held_lock:
             name, self.held, self.held_key = self.held, None, None
+        self.grip_q = None
         if self.teleport_hold():
             if self.pose_future is not None:
                 self.wait(self.pose_future, 2.0)
             if name:
+                self.get_logger().warn(f"TELEPORT: {name} moved to ({x:.3f}, {y:.3f}, {z:.3f}) (magic/attach mode)")
                 self.wait(self._send_pose(name, x, y, z), 2.0)
             if self.gripper == "robotiq":
                 self.open_gripper()
@@ -362,6 +460,7 @@ class SkillServer(Node):
                 time.sleep(0.4)
             self.open_gripper()
         if name and self.snap_release:
+            self.get_logger().warn(f"TELEPORT: {name} snapped to ({x:.3f}, {y:.3f}, {z:.3f}) (snap_release)")
             self.wait(self._send_pose(name, x, y, z), 2.0)
 
     # ---------- helpers ----------
@@ -510,12 +609,29 @@ class SkillServer(Node):
         return (True, "at home") if self.home() else (False, "failed to move home")
 
     def do_pick(self, gh):
+        """Grasp with automatic retries: a lost or missed grasp reopens, re-detects and tries again with more squeeze."""
         raw = gh.request.color
         name = canon(raw)
         if name is None:
             return False, f"unknown object '{raw}', use one of {ALL_NAMES}"
         if self.held_key:
             return False, f"already holding {self.held_key}; place it first"
+        ok, msg = False, ""
+        for attempt in range(1 + max(0, self.grasp_retries)):
+            self.cur_squeeze = self.squeeze * (1.0 + 0.6 * attempt)
+            if attempt:
+                self.get_logger().warn(f"grasp retry {attempt}/{self.grasp_retries} "
+                                       f"(squeeze {self.cur_squeeze:.3f}) after: {msg}")
+            ok, msg = self._pick_once(gh, name)
+            retryable = msg.startswith(("lost the object", "object slipped", "grasp missed", "grasp failed"))
+            if ok or not retryable or msg == "cancelled":
+                break
+        self.cur_squeeze = self.squeeze
+        if ok and attempt:
+            msg += f" (after {attempt} retr{'y' if attempt == 1 else 'ies'})"
+        return ok, msg
+
+    def _pick_once(self, gh, name):
         self.add_table()
         self.open_gripper()
         if not self.stage(gh, "moving home"): return False, "cancelled"
@@ -528,7 +644,7 @@ class SkillServer(Node):
         x, y, top = objs[name]
         self.get_logger().info(f"{name} detected at ({x:.3f}, {y:.3f}), top z={top:.3f}")
         hint = self.z_hint(top)
-        grasp_z = (top - CUBE / 2) + self.tcp
+        grasp_z = (top - CUBE / 2) + self.tcp + self.grasp_dz
         pre_z = grasp_z + APPROACH
         if not reachable(x, y, pre_z):
             return False, (f"{name} object at ({x:.2f},{y:.2f}) is out of the arm's reach "
@@ -540,7 +656,9 @@ class SkillServer(Node):
             if not self.go(xyz, cart): return False, f"motion failed while {text}"
         if self.gripper == "robotiq":
             if not self.stage(gh, "closing gripper"): return False, "cancelled"
+            self.diag("before close", name)
             ok, why = self.close_gripper()
+            self.diag("after close", name)
             if not ok:
                 self.open_gripper()
                 self.go([x, y, pre_z], True)
@@ -549,15 +667,30 @@ class SkillServer(Node):
             self.held, self.held_key = model_of(name), name
         time.sleep(0.3)
         if not self.stage(gh, "lifting"): return False, "cancelled"
-        if not self.go([x, y, pre_z], True): return False, "motion failed while lifting"
+        # lift in short stages so we see WHERE the object is lost, and stop as soon as it is
+        for dz in (0.01, 0.03, pre_z - grasp_z):
+            if not self.go([x, y, grasp_z + dz], True): return False, "motion failed while lifting"
+            self.diag(f"lift +{dz * 100:.0f} cm", name)
+            lost = self.check_grip(f"during the lift (at +{dz * 100:.0f} cm)")
+            if lost:
+                return False, lost
         if self.gripper == "robotiq" and self.grasp_check and not self.teleport_hold():
             q = self.finger_q()
             self.get_logger().info(f"after lift: q={q}")
             if q is not None and q >= GRIP_MISS_Q:
                 with self.held_lock:
                     self.held = self.held_key = None
+                self.grip_q = None
                 self.open_gripper()
                 return False, f"object slipped out of the gripper during the lift (q={q:.3f})"
+            lost = self.check_grip("during the lift")
+            if lost:
+                return False, lost
+        if self.gripper == "robotiq" and not self.teleport_hold():
+            time.sleep(0.6)                      # a cube that is about to drop does so now
+            lost = self.check_grip("right after the lift")
+            if lost:
+                return False, lost
         return True, f"picked {name} object"
 
     def do_place(self, gh):
@@ -575,6 +708,8 @@ class SkillServer(Node):
         self.add_table()
         if not self.stage(gh, "moving home"): return False, "cancelled"
         if not self.home(): return False, "failed to move home"
+        lost = self.check_grip("while carrying it home")
+        if lost: return False, lost
         objs = {}
         if target or self.collision_scene:
             if not self.stage(gh, f"detecting {target or 'objects'}"): return False, "cancelled"
@@ -599,6 +734,8 @@ class SkillServer(Node):
         for text, xyz, cart in steps:
             if not self.stage(gh, text): return False, "cancelled"
             if not self.go(xyz, cart): return False, f"motion failed while {text}"
+            lost = self.check_grip(f"while {text}")
+            if lost: return False, lost
         if self.gripper == "robotiq" and not self.stage(gh, "releasing"): return False, "cancelled"
         self.release_cube(x, y, surface + CUBE / 2 + 0.002)
         time.sleep(0.3)

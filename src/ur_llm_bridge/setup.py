@@ -10,5 +10,6 @@ setup(
     entry_points={'console_scripts': [
         'llm_bridge = ur_llm_bridge.llm_bridge:main',
         'llm_benchmark = ur_llm_bridge.benchmark:main',
-        'reset_scene = ur_llm_bridge.benchmark:reset_main']},
+        'reset_scene = ur_llm_bridge.benchmark:reset_main',
+        'grasp_sweep = ur_llm_bridge.grasp_sweep:main']},
 )
