@@ -119,7 +119,10 @@
         <gravity>true</gravity>
         <velocity_decay><linear>1.0</linear><angular>1.0</angular></velocity_decay>
         <inertial><mass>0.1</mass><inertia><ixx>4e-5</ixx><iyy>4e-5</iyy><izz>4e-5</izz></inertia></inertial>
-        <collision name="c"><geometry><sphere><radius>0.025</radius></sphere></geometry>
+        <!-- A real sphere keeps rolling forever on a flat box (no rolling resistance, and Gazebo here ignores velocity_decay),
+             and a teleport keeps its velocity. So the COLLISION shape is an upright flat-ended cylinder of the same width and
+             height (it cannot roll); the VISUAL is still a sphere, so the detector still sees a purple ball. -->
+        <collision name="c"><geometry><cylinder><radius>0.025</radius><length>0.05</length></cylinder></geometry>
           <surface>
             <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
             <contact><ode><kp>1e6</kp><kd>100</kd><max_vel>0.1</max_vel><min_depth>0.001</min_depth></ode></contact>

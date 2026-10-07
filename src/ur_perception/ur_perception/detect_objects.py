@@ -5,9 +5,11 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 from ur_interfaces.srv import DetectObjects
+from ur_perception.yaw import yaw_from_pixels, yaw_to_quat
 
 CAM_POS = np.array([0.6, 0.0, 1.2])   # must match the world file
 MIN_AREA = 30
+TOP_BAND = 0.012                      # depth pixels within this of the nearest ones (the top face) are used for the yaw
 COLORS = ["red", "green", "blue"]
 
 def color_mask(rgb, color):
@@ -45,7 +47,8 @@ class DetectService(Node):
             for i in range(1, n):
                 if stats[i, cv2.CC_STAT_AREA] < MIN_AREA:
                     continue
-                d = depth[labels == i]
+                comp = labels == i
+                d = depth[comp]
                 d = d[np.isfinite(d) & (d > 0)]
                 if len(d) < MIN_AREA:
                     continue
@@ -54,11 +57,16 @@ class DetectService(Node):
                 y_left = -(u - cx) * dd / fx
                 z_up = -(v - cy) * dd / fy
                 p = np.array([z_up, y_left, -dd]) + CAM_POS
+                # yaw of the cube from its top face only (the side faces seen in perspective would bias it)
+                top = comp & np.isfinite(depth) & (depth > 0) & (depth <= dd + TOP_BAND)
+                top_v, top_u = np.nonzero(top)
+                yaw = yaw_from_pixels(top_u, top_v)
+                _, _, qz, qw = yaw_to_quat(yaw)
                 ps = PoseStamped()
                 ps.header.frame_id = "base_link"
                 ps.header.stamp = self.depth.header.stamp
                 ps.pose.position.x, ps.pose.position.y, ps.pose.position.z = map(float, p)
-                ps.pose.orientation.w = 1.0
+                ps.pose.orientation.z, ps.pose.orientation.w = float(qz), float(qw)   # rotation about z, in (-45, 45] deg
                 res.poses.append(ps)
                 res.ids.append(f"{c}_{k}")
                 k += 1

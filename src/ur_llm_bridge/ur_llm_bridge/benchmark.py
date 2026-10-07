@@ -116,7 +116,7 @@ def _spin(node):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="qwen3:4b")
+    ap.add_argument("--model", default="qwen3:4b-instruct")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--only", nargs="*", help="case ids to run")
     ap.add_argument("--repeat", type=int, default=1)

@@ -1,6 +1,6 @@
 """Chat with the robot: Ollama LLM -> tool calls -> ROS 2 skills.
 
-  ros2 run ur_llm_bridge llm_bridge --ros-args -p model:=qwen3:4b
+ros2 run ur_llm_bridge llm_bridge --ros-args -p model:=qwen3:4b
   (add -p think:=true to let the model reason; default appends /no_think)
 Needs: sim, detect_objects, skill_server, and `ollama serve` with the model pulled.
 """
@@ -18,7 +18,7 @@ from ur_llm_bridge.agent import (TOOLS, compute_relative, new_history, ollama_ch
 class LLMBridge(Node):
     def __init__(self, name="llm_bridge"):
         super().__init__(name)
-        self.model = self.declare_parameter("model", "qwen3:4b").value
+        self.model = self.declare_parameter("model", "qwen3:4b-instruct").value
         self.host = self.declare_parameter("host", "http://localhost:11434").value
         self.think = self.declare_parameter("think", False).value
         self.detect_cli = self.create_client(DetectObjects, "/detect_objects")

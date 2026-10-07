@@ -17,12 +17,18 @@ Hold modes for robotiq (-p hold:=physics | attach, default physics):
   physics: the object is carried by finger friction only.
   attach : after a passed grasp check the object follows the tool by teleport (fallback while tuning physics).
 -p tcp:=0.15  distance from tool0 to the fingertip centre (tune this if the pads grab too high or too low).
+Cube yaw: detect_objects reports each cube's yaw (rotation about z, folded into +-45 deg) in the pose orientation. The
+wrist is rotated by that yaw (-p use_yaw:=true, -p yaw_deadband_deg:=5) so the fingers close on flat faces, and a held
+cube is put down aligned with the target cube (or with the world axes on the table).
 Only one skill runs at a time; a second goal is rejected while busy.
 Services: /reset_state (clear held state, open gripper, put the extra objects back, go home), /get_status.
 
 Objects: cubes red/green/blue (colour detector) and, when detect_open runs, can/ball/block (OBJECTS below).
 Collision scene: the table, plus every detected object except the held/picked one.
 Disable with  --ros-args -p collision_scene:=false ; ignore /detect_open with  -p open_vocab:=false
+Known positions: the last seen (x, y, top) of every object is remembered (self.known). When the arm carries a wide object
+at the home pose it can hide a place target from the overhead camera; do_place then falls back to the remembered position
+(log: "using the remembered position"). -p use_known:=false disables the fallback.
 """
 import math, time, threading, rclpy
 from rclpy.node import Node
@@ -56,6 +62,17 @@ RELEASE_CLEARANCE = 0.005
 CUBE_MARGIN = 0.01                # collision boxes are inflated by this (total, all axes)
 COLORS = ("red", "green", "blue")
 IDENT_QUAT = (0.0, 0.0, 0.0, 1.0)
+
+
+def quat_down_yaw(psi):
+    """Tool pointing down, rotated by psi about world z: q = Rz(psi) * Rx(pi) = (cos(psi/2), sin(psi/2), 0, 0).
+    With psi = 0 this is DOWN and the fingers open along world x; the finger axis then points along (cos psi, sin psi)."""
+    return [math.cos(psi / 2), math.sin(psi / 2), 0.0, 0.0]
+
+
+def quat_z(psi):
+    """(x, y, z, w) of a rotation about world z (collision boxes of rotated cubes)."""
+    return (0.0, 0.0, math.sin(psi / 2), math.cos(psi / 2))
 
 # Robotiq knuckle joint (radians). Calibrate GRIP_MIN_Q and GRIP_MISS_Q from the logged "fingers closed: q=" values.
 GRIP_OPEN = 0.0
@@ -122,6 +139,12 @@ class SkillServer(Node):
         self.tcp = float(self.declare_parameter("tcp", TCP_DEFAULT).value)
         self.squeeze = float(self.declare_parameter("squeeze", 0.08).value)
         self.cur_squeeze = self.squeeze   # squeeze used by the current grasp attempt (escalates on retries)
+        self.use_yaw = bool(self.declare_parameter("use_yaw", True).value)
+        self.use_known = bool(self.declare_parameter("use_known", True).value)
+        self.yaw_deadband = math.radians(float(self.declare_parameter("yaw_deadband_deg", 5.0).value))
+        self.yaws = {}                   # colour -> detected cube yaw (rad), refreshed by locate_all
+        self.known = {}                  # name -> last seen (x, y, top); fallback when the camera view is blocked
+        self.reset_settle = float(self.declare_parameter("reset_settle", 1.5).value)   # s the extra objects are held at their start pose after /reset_state
         self.grasp_retries = int(self.declare_parameter("grasp_retries", 2).value)   # extra attempts after a lost grasp
         self.snap_release = bool(self.declare_parameter("snap_release", False).value)   # teleports the object: keep OFF for honest tests
         self.slip_tol = float(self.declare_parameter("slip_tol", 0.025).value)
@@ -181,7 +204,8 @@ class SkillServer(Node):
             f"skill server ready: /move_home /pick_object /place_object /reset_state /get_status "
             f"(gripper={self.gripper}, hold={self.hold}, tcp={self.tcp}, squeeze={self.squeeze}, "
             f"snap_release={self.snap_release}, slip_tol={self.slip_tol}, grasp_dz={self.grasp_dz}, diag={self.diag_on}, "
-            f"collision_scene={self.collision_scene}, open_vocab={self.open_vocab}, names={ALL_NAMES})")
+            f"collision_scene={self.collision_scene}, open_vocab={self.open_vocab}, use_known={self.use_known}, "
+            f"names={ALL_NAMES})")
 
     def on_params(self, params):
         """Live tuning: ros2 param set /skill_server grasp_dz 0.005 (used by grasp_sweep)."""
@@ -191,6 +215,9 @@ class SkillServer(Node):
                 elif p.name == "squeeze": self.squeeze = self.cur_squeeze = float(p.value)
                 elif p.name == "tcp": self.tcp = float(p.value)
                 elif p.name == "slip_tol": self.slip_tol = float(p.value)
+                elif p.name == "use_yaw": self.use_yaw = bool(p.value)
+                elif p.name == "use_known": self.use_known = bool(p.value)
+                elif p.name == "yaw_deadband_deg": self.yaw_deadband = math.radians(float(p.value))
                 elif p.name == "grasp_retries": self.grasp_retries = int(p.value)
                 else: continue
                 self.get_logger().info(f"parameter {p.name} = {p.value}")
@@ -229,9 +256,17 @@ class SkillServer(Node):
             with self.held_lock:
                 self.held = self.held_key = None
             self.grip_q = None
+            self.known = {}
             self.open_gripper()
-            for model, (x, y, z) in OBJECT_START.items():
-                self.wait(self._send_pose(model, x, y, z), 3.0)
+            # A teleport keeps the old velocity, so a rolling ball would keep rolling: hold the extras at their start
+            # pose for a moment so leftover motion dies out (heavy damping on the ball in the world file does the rest).
+            t_end = time.time() + max(0.0, self.reset_settle)
+            while True:
+                for model, (x, y, z) in OBJECT_START.items():
+                    self.wait(self._send_pose(model, x, y, z), 3.0)
+                if time.time() >= t_end:
+                    break
+                time.sleep(0.1)
             self.add_table()
             ok = self.home()
             res.success = ok
@@ -471,12 +506,26 @@ class SkillServer(Node):
         return fut.result() if fut.done() else None
 
     def locate_all(self, need=()):
+        """Detect everything visible and remember it (self.known). The held object is never remembered."""
+        out = self._detect_all(need)
+        for k, v in out.items():
+            if k != self.held_key:
+                self.known[k] = v
+        return out
+
+    def _detect_all(self, need=()):
         req = DetectObjects.Request(); req.color = "all"
         res = self.wait(self.detect_cli.call_async(req))
         out = {}
+        self.yaws = {}
         if res is not None and res.success:
             for i, p in zip(res.ids, res.poses):
-                out.setdefault(i.split("_")[0], (p.pose.position.x, p.pose.position.y, p.pose.position.z))
+                key = i.split("_")[0]
+                if key in out:
+                    continue
+                out[key] = (p.pose.position.x, p.pose.position.y, p.pose.position.z)
+                o = p.pose.orientation
+                self.yaws[key] = 2.0 * math.atan2(o.z, o.w)
         self.open_note = ""
         wants_extra = any(n in OBJECTS for n in need)
         if not self.open_vocab:
@@ -535,9 +584,10 @@ class SkillServer(Node):
                     continue
                 x, y, top = objs[n]
                 sx, sy, sz = size_of(n)
+                box_q = quat_z(self.yaws.get(n, 0.0)) if (self.use_yaw and n in COLORS) else IDENT_QUAT
                 self.moveit2.add_collision_box(id=cid, size=(sx + CUBE_MARGIN, sy + CUBE_MARGIN, sz + CUBE_MARGIN),
                                                position=(x, y, top - sz / 2),
-                                               quat_xyzw=IDENT_QUAT, frame_id="base_link")
+                                               quat_xyzw=box_q, frame_id="base_link")
                 self.scene_boxes[n] = (x, y, top)
             time.sleep(0.3)
         except Exception as e:
@@ -556,9 +606,19 @@ class SkillServer(Node):
         return (f"motion to ({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}) cartesian={cartesian} failed. "
                 f"boxes in scene: {boxes}. holding: {self.held_key}. {self.state_report()}")
 
-    def go(self, xyz, cartesian=False):
+    def yaw_of(self, name):
+        """Detected yaw of a cube (rad); 0 for the extra objects, small angles (detection noise) and when disabled."""
+        if not self.use_yaw or name not in COLORS:
+            return 0.0
+        y = self.yaws.get(name, 0.0)
+        return 0.0 if abs(y) < self.yaw_deadband else y
+
+    def tool_quat(self, psi):
+        return quat_down_yaw(psi) if psi else DOWN
+
+    def go(self, xyz, cartesian=False, quat=None):
         for attempt in (1, 2):
-            self.moveit2.move_to_pose(position=list(xyz), quat_xyzw=DOWN, cartesian=cartesian)
+            self.moveit2.move_to_pose(position=list(xyz), quat_xyzw=quat or DOWN, cartesian=cartesian)
             if self.moveit2.wait_until_executed():
                 if attempt == 2:
                     self.get_logger().warn("motion worked only WITHOUT object boxes: one of them blocks it")
@@ -627,6 +687,8 @@ class SkillServer(Node):
             if ok or not retryable or msg == "cancelled":
                 break
         self.cur_squeeze = self.squeeze
+        if ok:
+            self.known.pop(name, None)           # it is in the gripper now, not on the table
         if ok and attempt:
             msg += f" (after {attempt} retr{'y' if attempt == 1 else 'ies'})"
         return ok, msg
@@ -644,6 +706,10 @@ class SkillServer(Node):
         x, y, top = objs[name]
         self.get_logger().info(f"{name} detected at ({x:.3f}, {y:.3f}), top z={top:.3f}")
         hint = self.z_hint(top)
+        psi = self.yaw_of(name)
+        quat = self.tool_quat(psi)
+        if psi:
+            self.get_logger().info(f"{name} yaw = {math.degrees(psi):+.1f} deg: rotating the wrist to match")
         grasp_z = (top - CUBE / 2) + self.tcp + self.grasp_dz
         pre_z = grasp_z + APPROACH
         if not reachable(x, y, pre_z):
@@ -653,7 +719,7 @@ class SkillServer(Node):
                  ("descending", [x, y, grasp_z], True))
         for text, xyz, cart in steps:
             if not self.stage(gh, text): return False, "cancelled"
-            if not self.go(xyz, cart): return False, f"motion failed while {text}"
+            if not self.go(xyz, cart, quat): return False, f"motion failed while {text}"
         if self.gripper == "robotiq":
             if not self.stage(gh, "closing gripper"): return False, "cancelled"
             self.diag("before close", name)
@@ -661,7 +727,7 @@ class SkillServer(Node):
             self.diag("after close", name)
             if not ok:
                 self.open_gripper()
-                self.go([x, y, pre_z], True)
+                self.go([x, y, pre_z], True, quat)
                 return False, why
         with self.held_lock:
             self.held, self.held_key = model_of(name), name
@@ -669,7 +735,7 @@ class SkillServer(Node):
         if not self.stage(gh, "lifting"): return False, "cancelled"
         # lift in short stages so we see WHERE the object is lost, and stop as soon as it is
         for dz in (0.01, 0.03, pre_z - grasp_z):
-            if not self.go([x, y, grasp_z + dz], True): return False, "motion failed while lifting"
+            if not self.go([x, y, grasp_z + dz], True, quat): return False, "motion failed while lifting"
             self.diag(f"lift +{dz * 100:.0f} cm", name)
             lost = self.check_grip(f"during the lift (at +{dz * 100:.0f} cm)")
             if lost:
@@ -716,6 +782,12 @@ class SkillServer(Node):
             objs = self.locate_all(need=(target,) if target else ())
             self.sync_cubes(objs)
         if target:
+            if target not in objs and self.use_known and target in self.known:
+                # the carried object can hide the target from the overhead camera at the home pose
+                objs[target] = self.known[target]
+                kx, ky, kt = objs[target]
+                self.get_logger().warn(f"{target} not visible (hidden by the carried {self.held_key}?): "
+                                       f"using the remembered position ({kx:.3f}, {ky:.3f}), top z={kt:.3f}")
             if target not in objs:
                 return False, f"no {target} object detected to place on{self.open_note}"
             x, y, surface = objs[target]
@@ -724,6 +796,12 @@ class SkillServer(Node):
         else:
             x, y = r.x, r.y
             surface = r.surface_z if r.surface_z > 0 else TABLE_TOP
+        # a held cube was grasped with its faces aligned to the gripper: put it down aligned with the target cube
+        # (or with the world axes on the table) by turning the gripper to that yaw
+        psi = self.yaw_of(target) if target else 0.0
+        quat = self.tool_quat(psi)
+        if self.held_key in COLORS and psi:
+            self.get_logger().info(f"placing aligned with {target} (yaw {math.degrees(psi):+.1f} deg)")
         place_z = (surface + CUBE / 2) + self.tcp + RELEASE_CLEARANCE
         pre_z = place_z + APPROACH
         if not reachable(x, y, pre_z):
@@ -733,14 +811,16 @@ class SkillServer(Node):
                  ("descending", [x, y, place_z], True))
         for text, xyz, cart in steps:
             if not self.stage(gh, text): return False, "cancelled"
-            if not self.go(xyz, cart): return False, f"motion failed while {text}"
+            if not self.go(xyz, cart, quat): return False, f"motion failed while {text}"
             lost = self.check_grip(f"while {text}")
             if lost: return False, lost
         if self.gripper == "robotiq" and not self.stage(gh, "releasing"): return False, "cancelled"
+        placed = self.held_key
         self.release_cube(x, y, surface + CUBE / 2 + 0.002)
+        self.known[placed] = (x, y, surface + CUBE)       # remember where it landed (top surface)
         time.sleep(0.3)
         if not self.stage(gh, "retreating"): return False, "cancelled"
-        if not self.go([x, y, pre_z], True): return False, "placed, but retreat failed"
+        if not self.go([x, y, pre_z], True, quat): return False, "placed, but retreat failed"
         return True, "placed"
 
 

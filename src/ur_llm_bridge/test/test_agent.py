@@ -1,4 +1,4 @@
-"""Run: python3 src/ur_llm_bridge/ur_llm_bridge/test_agent.py   (no ROS or Ollama needed)"""
+"""Run: python3 src/ur_llm_bridge/test/test_agent.py   (no ROS or Ollama needed)"""
 import json, sys, os, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -11,9 +11,11 @@ SCRIPT = [
 ]
 class H(BaseHTTPRequestHandler):
     i = 0
+    last = None
+    stats = {}
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
-        body = json.dumps({"message": SCRIPT[H.i]}).encode(); H.i += 1
+        H.last = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        body = json.dumps({"message": dict(SCRIPT[H.i]), **H.stats}).encode(); H.i += 1
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
@@ -36,6 +38,53 @@ assert validate("pick_object", {"color": "purple"})[1]
 assert validate("place_object", {"x": 5, "y": 0})[1]
 assert validate("place_object", {"x": 0.5, "y": 0.1})[0]["target"] == ""
 assert validate("fly", {})[1]
+
+# extra objects: can / ball / block (names, aliases, rules)
+for raw, want in (("can", "can"), ("Yellow Can", "can"), ("yellow_can", "can"), ("ball", "ball"),
+                  ("purple ball", "ball"), ("block", "block"), ("white block", "block"),
+                  ("Red", "red"), ("red cube", "red"), ("object", None), ("purple", None), ("purple cube", None),
+                  ("", None), (None, None)):
+    assert canon_name(raw) == want, (raw, canon_name(raw))
+assert validate("pick_object", {"color": "can"})[0] == {"color": "can"}
+assert validate("pick_object", {"color": "Purple Ball"})[0] == {"color": "ball"}
+assert validate("pick_object", {"object": "block"})[0] == {"color": "block"}          # tolerated alias for the argument
+assert validate("pick_object", {"color": "purple cube"})[1]                             # there is no purple cube
+assert validate("pick_object", {"color": "orange"})[1]
+assert validate("place_object", {"target": "can"})[0] == {"target": "can"}
+assert validate("place_object", {"target": "white block"})[0] == {"target": "block"}
+assert validate("place_object", {"target": "ball"})[1] and "round" in validate("place_object", {"target": "ball"})[1]
+assert validate("place_object", {"target": "purple"})[1]
+assert validate("place_object", {"target": "", "x": 0.5, "y": 0.0})[0] == {"target": "", "x": 0.5, "y": 0.0}
+assert validate("place_in_zone", {"zone": "right"})[0] == {"zone": "right"}           # works for a held extra object too
+assert validate("sort_cubes", {"assignments": {"can": "left"}})[1]                     # cubes only
+assert validate("build_tower", {"order": ["red", "can"]})[1]                           # cubes only
+assert validate("place_relative", {"reference": "can", "relation": "left"})[1]         # reference must be a cube
+tool = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in TOOLS}
+assert tool["pick_object"]["color"]["enum"] == ["red", "green", "blue", "can", "ball", "block"]
+assert tool["place_object"]["target"]["enum"] == ["red", "green", "blue", "can", "ball", "block", ""]
+assert "can" in SYSTEM and "ball" in SYSTEM and "block" in SYSTEM and "no purple cube" in SYSTEM
+# a scripted run: pick the can, put it on the red cube
+SCRIPT[:] = [
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "pick_object", "arguments": {"color": "yellow can"}}}]},
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "place_object", "arguments": {"target": "red"}}}]},
+    {"role": "assistant", "content": "Done."},
+]
+H.i = 0
+calls.clear()
+out = run_agent(new_history(), "put the can on the red cube", execute, lambda m: ollama_chat(host, "x", m, TOOLS),
+                log=lambda *_: None)
+assert calls == [("pick_object", {"color": "can"}), ("place_object", {"target": "red"})], calls
+# a place on the ball is rejected before it reaches the robot
+SCRIPT[:] = [
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "place_object", "arguments": {"target": "ball"}}}]},
+    {"role": "assistant", "content": "I cannot stack on the ball."},
+]
+H.i = 0
+calls.clear()
+out = run_agent(new_history(), "put it on the ball", execute, lambda m: ollama_chat(host, "x", m, TOOLS),
+                log=lambda *_: None)
+assert calls == [] and out == "I cannot stack on the ball.", (calls, out)
+
 # place_relative validation
 v = validate("place_relative", {"reference": "Blue", "relation": "left"})[0]
 assert v == {"reference": "blue", "relation": "left", "distance": 0.1}, v
@@ -151,4 +200,50 @@ hh = new_history()
 for k in range(30):
     hh += [{"role": "user", "content": str(k)}, {"role": "assistant", "content": "a"}]
 trim(hh, 20); assert hh[0]["role"] == "system" and hh[1]["role"] == "user" and len(hh) <= 20
+
+# ---- latency features ----
+# request options: fixed context and a hard cap on generated tokens
+H.i = 0
+SCRIPT[:] = [{"role": "assistant", "content": "ok"}]
+ollama_chat(host, "x", new_history(), TOOLS)
+opt = H.last["options"]
+assert opt["num_predict"] == NUM_PREDICT == 256 and opt["num_ctx"] == NUM_CTX == 4096 and opt["temperature"] == 0, opt
+# timing stats from Ollama are attached to the message, logged by run_agent, and never stored in the history
+H.i = 0
+H.stats = {"load_duration": 2_000_000_000, "prompt_eval_count": 900, "prompt_eval_duration": 3_000_000_000,
+           "eval_count": 25, "eval_duration": 1_500_000_000}
+SCRIPT[:] = [{"role": "assistant", "content": "Hello."}]
+logs = []
+hh = new_history()
+out = run_agent(hh, "hi", execute, lambda m: ollama_chat(host, "x", m, TOOLS), log=logs.append)
+assert out == "Hello." and any("prompt 900 tok in 3.0s" in l and "output 25 tok in 1.5s" in l for l in logs), logs
+assert all("_stats" not in m for m in hh)
+H.stats = {}
+# the prompt got shorter (latency): system prompt and tool schemas are compact
+assert len(SYSTEM) < 2400, len(SYSTEM)
+assert len(json.dumps(TOOLS)) < 3300, len(json.dumps(TOOLS))
+# fast macros: a successful macro tool is reported without the closing LLM call
+n_chat = []
+def chat_macro(msgs):
+    n_chat.append(1)
+    return {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "build_tower", "arguments": {"order": ["red", "green"]}}}]}
+res_ok = {"success": True, "message": "tower built, bottom to top: red, green", "stacked": 2}
+r = run_agent(new_history(), "stack green on red", lambda n, a: res_ok, chat_macro, fast_macros=True, log=lambda *_: None)
+assert r == "Done: tower built, bottom to top: red, green." and len(n_chat) == 1, (r, n_chat)
+# ... but not on failure, not for pick/place, and not when disabled
+class Seq:
+    def __init__(self, first_call):
+        self.first, self.n = first_call, 0
+    def __call__(self, msgs):
+        self.n += 1
+        if self.n == 1:
+            return {"role": "assistant", "content": "", "tool_calls": [{"function": self.first}]}
+        return {"role": "assistant", "content": "Finished."}
+res_bad = {"success": False, "message": "pick green failed"}
+c = Seq({"name": "build_tower", "arguments": {"order": ["red", "green"]}})
+assert run_agent(new_history(), "x", lambda n, a: res_bad, c, fast_macros=True, log=lambda *_: None) == "Finished." and c.n == 2
+c = Seq({"name": "pick_object", "arguments": {"color": "red"}})
+assert run_agent(new_history(), "x", lambda n, a: res_ok, c, fast_macros=True, log=lambda *_: None) == "Finished." and c.n == 2
+c = Seq({"name": "build_tower", "arguments": {"order": ["red", "green"]}})
+assert run_agent(new_history(), "x", lambda n, a: res_ok, c, fast_macros=False, log=lambda *_: None) == "Finished." and c.n == 2
 print("all agent tests passed")

@@ -1,4 +1,4 @@
-"""Run: python3 src/ur_llm_bridge/ur_llm_bridge/test_bench_lib.py   (no ROS needed)"""
+"""Run: python3 src/ur_llm_bridge/test/test_bench_lib.py   (no ROS needed)"""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ur_llm_bridge import bench_lib as B
@@ -9,8 +9,9 @@ def P(**kw):
 
 # case table sanity
 ids = [c[0] for c in B.CASES]
-assert len(ids) == len(set(ids)) == 27, len(ids)
-assert "multi_tower_brg" in ids
+assert len(ids) == len(set(ids)) == 35, len(ids)
+assert "multi_tower_brg" in ids and "refuse_orange" in ids and "refuse_purple" not in ids
+assert sum(1 for c in B.CASES if c[1] == "objects") == 8
 
 ev = B.evaluate
 assert ev(("unchanged",), I, I)[0]
@@ -52,6 +53,31 @@ assert ev(("rel", "red", "blue", "front"), P(red=(0.5, -0.15, 0.225)), I)[0]
 assert ev(("rel", "red", "blue", "behind"), P(red=(0.7, -0.15, 0.225)), I)[0]
 assert not ev(("rel", "red", "blue", "left"), P(red=(0.6, -0.05, 0.30)), I)[0]      # in the air
 
+# extra objects: names map to the Gazebo models, poses are keyed by model name
+assert B._c("can") == "yellow_can" and B._c("ball") == "purple_ball" and B._c("block") == "white_block"
+assert B._c("red") == "red_cube" and B._c("red_cube") == "red_cube"
+assert set(B.EXTRA_MODELS.values()) <= set(B.CUBES) and len(B.CUBES) == 6
+E = dict(I); E.update({"yellow_can": (0.72, -0.30, 0.225), "purple_ball": (0.38, 0.34, 0.225),
+                       "white_block": (0.80, 0.0, 0.225)})
+def Q(**kw):
+    p = dict(E); p.update(kw); return p
+assert ev(("held", "can"), Q(yellow_can=(0.72, -0.30, 0.343)), E)[0]
+assert not ev(("held", "can"), E, E)[0]
+assert not ev(("held", "ball"), E, E)[0] and ev(("held", "ball"), Q(purple_ball=(0.4, 0.3, 0.34)), E)[0]
+assert ev(("held", "block"), Q(white_block=(0.8, 0.0, 0.34)), E)[0]
+assert ev(("at", "can", 0.5, 0.0), Q(yellow_can=(0.51, 0.01, 0.226)), E)[0]
+assert not ev(("at", "can", 0.5, 0.0), Q(yellow_can=(0.72, -0.30, 0.225)), E)[0]          # never moved
+assert ev(("at", "ball", 0.5, 0.2), Q(purple_ball=(0.48, 0.21, 0.225)), E)[0]
+# can on the red cube (red at (0.5, 0.1)), ball on the white block (0.8, 0.0)
+assert ev(("on", "can", "red"), Q(yellow_can=(0.5, 0.1, 0.275)), E)[0]
+assert not ev(("on", "can", "red"), Q(yellow_can=(0.5, 0.1, 0.225)), E)[0]                 # overlapping
+assert ev(("on", "ball", "block"), Q(purple_ball=(0.8, 0.0, 0.275)), E)[0]
+assert not ev(("on", "ball", "block"), Q(purple_ball=(0.8, 0.06, 0.275)), E)[0]            # rolled off
+assert ev(("in_zone", "can", "right"), Q(yellow_can=(0.51, -0.32, 0.225)), E)[0]
+assert not ev(("in_zone", "can", "right"), E, E)[0]
+assert not ev(("held", "can"), I, I)[0] and "pose unknown" in ev(("held", "can"), I, I)[1]  # extras missing -> clear failure
+assert ev(("unchanged",), Q(yellow_can=(0.1, 0.1, 0.5)), E)[0]                            # `unchanged` only watches the cubes
+
 # gz protobuf-text fallback parser (zero fields are omitted in this format!)
 txt = '''
 pose { name: "ground" id: 1 }
@@ -79,11 +105,17 @@ pose {
   }
 }
 pose { name: "blue_cube" id: 10 position { x: 0.6 y: -0.15 z: 0.225 } }
+pose { name: "yellow_can" id: 11 position { x: 0.72 y: -0.3 z: 0.225 } }
+pose { name: "purple_ball" id: 12 position { x: 0.38 y: 0.34 z: 0.225 } }
+pose { name: "white_block" id: 13 position { x: 0.8 z: 0.225 } }
 '''
 g = B.parse_gz_poses(txt)
 assert g["red_cube"] == (0.5, 0.1, 0.225), g
 assert g["green_cube"] == (0.7, 0.0, 0.225), g          # y omitted -> 0
 assert g["blue_cube"] == (0.6, -0.15, 0.225), g
+assert g["yellow_can"] == (0.72, -0.3, 0.225), g
+assert g["purple_ball"] == (0.38, 0.34, 0.225), g
+assert g["white_block"] == (0.8, 0.0, 0.225), g          # y omitted -> 0
 
 fake = [dict(id="a", category="pick", passed=True, tool_failures=0, rejected=0, tool_calls=1, wall_s=10, llm_s=3, detail="", reply=""),
         dict(id="b", category="pick", passed=False, tool_failures=1, rejected=0, tool_calls=2, wall_s=20, llm_s=6, detail="bad", reply="x")]

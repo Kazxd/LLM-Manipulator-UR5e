@@ -1,7 +1,18 @@
 """ROS-free LLM agent loop for Ollama tool calling (stdlib only, unit-testable)."""
-import json, math, re, urllib.request
+import json, math, os, re, urllib.request
+
+# Latency options (see the notes at ollama_chat / run_agent):
+NUM_CTX = 4096            # fixed context size; changing it makes Ollama reload the model
+NUM_PREDICT = 256         # hard cap on generated tokens (a rambling answer once took 5 minutes)
+MACRO_TOOLS = ("build_tower", "sort_cubes", "move_home")   # one call does the whole job
+FAST_MACROS = os.environ.get("UR_FAST_MACROS") == "1"      # skip the final LLM call after a successful macro tool
+MAX_REPLY_CHARS = 500     # a longer reply without a tool call is reasoning, not an answer
+MAX_RAMBLES = 2           # retries after a rambling reply before giving up
 
 COLORS = ("red", "green", "blue")
+EXTRA_OBJECTS = ("can", "ball", "block")          # yellow cylinder, purple sphere, white box (need detect_open)
+OBJECT_NAMES = COLORS + EXTRA_OBJECTS
+ALIASES = {"yellow can": "can", "purple ball": "ball", "white block": "block"}
 X_RANGE = (0.30, 0.90)    # safe workspace on the table (metres, base frame)
 Y_RANGE = (-0.40, 0.40)
 TOOL_NAMES = ("pick_object", "place_object", "place_relative", "place_in_zone", "sort_cubes",
@@ -16,6 +27,17 @@ ZONE_HALF = 0.10          # pad half-size (m)
 ZONE_CENTERS = {"left": (0.55, 0.28), "right": (0.55, -0.28)}
 ZONES = tuple(ZONE_CENTERS)
 SLOT_OFFSETS = ((-0.04, -0.04), (0.04, -0.04), (-0.04, 0.04), (0.04, 0.04))   # 4 cubes per zone
+
+
+def canon_name(value):
+    """'Red', 'red cube', 'red box', 'yellow can', 'yellow_can', 'Ball' -> 'red' / 'can' / 'ball'; None if unknown."""
+    n = str(value or "").lower().strip().replace("_", " ")
+    if n.endswith(" cube"):
+        n = n[:-5]
+    elif n.endswith(" box") and n[:-4] in COLORS:      # "red box" is a cube; "white box" stays the block
+        n = n[:-4]
+    n = ALIASES.get(n, n)
+    return n if n in OBJECT_NAMES else None
 
 
 def zone_contains(zone, x, y, margin=0.025):
@@ -34,6 +56,8 @@ def zone_slot(zone, others):
     return None, f"the {zone} zone is full"
 
 _CALL_RE = re.compile(r"^\s*`{0,3}\w*\s*(" + "|".join(TOOL_NAMES) + r")\s*\((.*)\)\s*`{0,3}\s*$", re.S)
+POSITIONAL = {"pick_object": ("color",), "detect_objects": ("color",), "place_object": ("target", "x", "y"),
+              "place_in_zone": ("zone",), "place_relative": ("reference", "relation", "distance_cm")}
 _ARG_RE = re.compile(r'(\w+)\s*=\s*("[^"]*"|\'[^\']*\'|[-+0-9.eE]+)')
 
 
@@ -63,6 +87,14 @@ def salvage_calls(text):
     for k, v in _ARG_RE.findall(m.group(2)):
         v = v.strip("\"'")
         args[k] = float(v) if re.fullmatch(r"[-+0-9.eE]+", v) else v
+    raw = m.group(2).strip()
+    if not args and raw and not re.search(r"[\[\]{}=]", raw):      # positional: pick_object(can), place_object(0.5, 0.1)
+        toks = [t.strip().strip("\"'") for t in raw.split(",") if t.strip()]
+        names = list(POSITIONAL.get(m.group(1), ()))
+        if m.group(1) == "place_object" and toks and re.fullmatch(r"[-+0-9.eE]+", toks[0]):
+            names = ["x", "y"]
+        for k, v in zip(names, toks):
+            args[k] = float(v) if re.fullmatch(r"[-+0-9.eE]+", v) else v
     return [{"function": {"name": m.group(1), "arguments": args}}]
 
 
@@ -73,60 +105,55 @@ def _fn(name, desc, props, required=()):
 
 
 TOOLS = [
-    _fn("detect_objects",
-        "Look at the table and list coloured cubes with x,y position in metres. Use it to check the scene.",
+    _fn("detect_objects", "List the coloured cubes with x,y in metres (cubes only).",
         {"color": {"type": "string", "enum": ["red", "green", "blue", "all"]}}),
-    _fn("pick_object",
-        "Pick up the cube of the given colour. The robot must not already be holding something.",
-        {"color": {"type": "string", "enum": list(COLORS)}}, ["color"]),
-    _fn("place_object",
-        "Place the held cube. Either on top of another cube (give target = its colour) "
-        "or on the table at x,y metres (leave target empty).",
-        {"target": {"type": "string", "enum": list(COLORS) + [""]},
+    _fn("pick_object", "Pick up a cube (red, green, blue) or can, ball, block. The argument is called color for all.",
+        {"color": {"type": "string", "enum": list(OBJECT_NAMES)}}, ["color"]),
+    _fn("place_object", "Place the held object on top of target (an object name, never the ball) "
+        "or on the table at x,y metres (target empty).",
+        {"target": {"type": "string", "enum": list(OBJECT_NAMES) + [""]},
          "x": {"type": "number"}, "y": {"type": "number"}}),
-    _fn("place_relative",
-        "Place the held cube on the table next to another cube. relation is seen from the robot base looking "
-        "along +x: left = +y side, right = -y side, front = toward the robot, behind = away from the robot, "
-        "next_to = any free side. distance_cm is the centre-to-centre distance (default 10).",
+    _fn("place_relative", "Place the held object on the table next to a cube. left = +y, right = -y, "
+        "front = toward the robot, behind = away, next_to = any free side. distance_cm default 10.",
         {"reference": {"type": "string", "enum": list(COLORS)},
          "relation": {"type": "string", "enum": list(RELATIONS)},
          "distance_cm": {"type": "number"}}, ["reference", "relation"]),
-    _fn("place_in_zone",
-        f"Place the held cube in a named table zone ({', '.join(ZONES)}); the robot picks a free spot in it.",
+    _fn("place_in_zone", f"Place the held object in a table zone ({', '.join(ZONES)}).",
         {"zone": {"type": "string", "enum": list(ZONES)}}, ["zone"]),
-    _fn("sort_cubes",
-        "Move several cubes into zones in one call. assignments maps a colour to a zone, e.g. "
-        "{\"red\": \"left\", \"green\": \"left\", \"blue\": \"right\"}. Cubes already in their zone are skipped. "
-        "The robot must hold nothing.",
+    _fn("sort_cubes", "Move several cubes into zones in one call, e.g. {\"red\": \"left\", \"blue\": \"right\"}. "
+        "Hold nothing first. Cubes only.",
         {"assignments": {"type": "object",
                          "properties": {c: {"type": "string", "enum": list(ZONES)} for c in COLORS}}},
         ["assignments"]),
-    _fn("build_tower",
-        "Stack cubes into a tower in one call. order = colours from BOTTOM to TOP, e.g. [\"red\",\"green\",\"blue\"] "
-        "puts green on red and blue on green. Use this for any request to stack 2-3 cubes. "
-        "The robot must hold nothing and the cubes must be on the table.",
+    _fn("build_tower", "Stack 2-3 cubes in one call. order = colours from BOTTOM to TOP. Hold nothing first. Cubes only.",
         {"order": {"type": "array", "items": {"type": "string", "enum": list(COLORS)}}}, ["order"]),
     _fn("move_home", "Move the arm to its home pose.", {}),
 ]
 
-SYSTEM = f"""You control a UR5e robot arm that moves coloured cubes on a table, using tools.
-Cubes: red, green, blue. Table workspace: x {X_RANGE[0]} to {X_RANGE[1]}, y {Y_RANGE[0]} to {Y_RANGE[1]} metres.
+SYSTEM = f"""You control a UR5e arm that moves objects on a table by calling tools.
+Objects: cubes red, green, blue; also can (yellow cylinder), ball (purple sphere), block (white box). There is no purple cube: the purple object is the ball. "red box" means the red cube. Workspace x {X_RANGE[0]} to {X_RANGE[1]}, y {Y_RANGE[0]} to {Y_RANGE[1]} m.
 Rules:
-- Call ONE tool at a time and wait for its result before the next call.
-- To move a cube: pick_object(color) first, then place_object(target=...) or place_object(x, y).
-- The robot can hold only one cube. If it holds one, place it before picking another.
-- Each request starts with a [Current scene] line: trust it, do not call detect_objects unless you need a fresh look.
-- If a tool returns success=false, read the message, try at most one sensible fix, otherwise tell the user what went wrong.
-- Never invent tools, colours or coordinates outside the workspace.
-- For "left of / right of / in front of / behind / next to <cube>": pick_object first, then place_relative. Do not compute coordinates yourself.
-- Directions are from the robot base looking along +x: left = +y, right = -y, front = toward the robot, behind = away from it.
-- Table zones: {", ".join(ZONES)} (flat pads on the table, "left" = +y side, "right" = -y side). For ONE cube: pick_object, then place_in_zone(zone). For SEVERAL cubes: call sort_cubes(assignments) ONCE.
-- To stack 2 or 3 cubes, call build_tower(order) ONCE (order is bottom to top). Do not do the picks and places yourself.
-- ALWAYS act by calling a tool. Never describe a tool call or write a command in text instead of calling it.
-- If the request is ambiguous (which cube? which direction? how far?), do NOT guess: reply with one short clarifying question and call no tool.
-- Multi-step requests: do every step in order, one tool per turn, until all are done. Only report success if every tool result said success=true.
-- If a place fails, report the failure honestly; do not claim the task is complete.
-- When the task is finished (or impossible), reply in one or two short sentences with no tool call."""
+- NEVER think aloud or explain. Your reply is either a tool call or one short sentence.
+- Call ONE tool at a time and wait for its result. ALWAYS act through the tool interface, never write a call as text.
+- Move an object: pick_object(color), then place_object(target) (on top of that object, never the ball) or place_object(x, y). Hold one object at a time.
+- Each request starts with a [Current scene] line (cubes only; can, ball and block are always there). Trust it.
+- Directions seen from the robot looking along +x: left = +y, right = -y, front = toward the robot, behind = away from it.
+- "left of / right of / in front of / behind / next to <cube>": pick_object, then place_relative.
+- Zones {", ".join(ZONES)} (flat pads, left = +y). One object: pick_object, then place_in_zone. Several cubes: sort_cubes once.
+- Stack 2-3 cubes: build_tower(order, bottom to top) once. sort_cubes and build_tower take cubes only.
+- If a tool fails, try at most one fix, else say what went wrong. Report success only if every result was success=true.
+- If the request is ambiguous (which object? direction? distance?), ask one short question and call no tool.
+- When done or impossible, reply in one or two short sentences without a tool call."""
+
+
+EXAMPLES = """
+Examples (make the calls through the tool interface; arguments are always named):
+- "stack red on top of green": build_tower(order=["green","red"]). "put red on blue": pick_object(color="red"), then place_object(target="blue"). Never say a stack is out of reach: call the tools, they check reach.
+- "pick up the can": pick_object(color="can"). "put the can on the red cube": pick_object(color="can"), then place_object(target="red"). The can, ball and block are ALWAYS on the table even though the scene line omits them. Never refuse or ask because they are missing from the scene line.
+- "move the ball to x 0.5 y 0.2": pick_object(color="ball"), then place_object(target="", x=0.5, y=0.2).
+- "move green next to blue": pick_object(color="green"), then place_relative(reference="blue", relation="next_to"). Do not ask which side.
+- Ask "Which cube?" ONLY if the request names no object at all (e.g. "move the cube to the left"). A request naming red, green, blue, can, ball or block is never ambiguous.
+- "white block" and "block" are the same object."""
 
 
 def validate(name, args):
@@ -139,20 +166,23 @@ def validate(name, args):
             return None, f"color must be one of {list(COLORS) + ['all']}"
         return {"color": c}, None
     if name == "pick_object":
-        c = str(args.get("color", "")).lower()
-        if c not in COLORS:
-            return None, f"color must be one of {list(COLORS)}"
+        c = canon_name(args.get("color") or args.get("object"))
+        if c is None:
+            return None, f"color must be one of {list(OBJECT_NAMES)}"
         return {"color": c}, None
     if name == "place_object":
-        t = str(args.get("target") or "").lower()
-        if t:
-            if t not in COLORS:
-                return None, f"target must be one of {list(COLORS)} or empty"
+        raw = str(args.get("target") or "").strip()
+        if raw:
+            t = canon_name(raw)
+            if t is None:
+                return None, f"target must be one of {list(OBJECT_NAMES)} or empty"
+            if t == "ball":
+                return None, "cannot place on top of the ball: its top is round"
             return {"target": t}, None
         try:
             x, y = float(args["x"]), float(args["y"])
         except (KeyError, TypeError, ValueError):
-            return None, "give either target (a colour) or both x and y"
+            return None, "give either target (an object name) or both x and y"
         if not (X_RANGE[0] <= x <= X_RANGE[1] and Y_RANGE[0] <= y <= Y_RANGE[1]):
             return None, f"x,y outside workspace x {X_RANGE}, y {Y_RANGE}"
         return {"target": "", "x": x, "y": y}, None
@@ -228,7 +258,7 @@ def compute_relative(ref, relation, dist, others):
     return None, "no valid spot (" + "; ".join(reasons) + ")"
 
 
-def ollama_chat(host, model, messages, tools, timeout=300, no_think=True):
+def ollama_chat(host, model, messages, tools, timeout=300, no_think=True, num_ctx=NUM_CTX, num_predict=NUM_PREDICT):
     """no_think appends /no_think to the latest user message (on a copy; history is untouched)."""
     msgs = [dict(m) for m in messages]
     if no_think:
@@ -237,15 +267,21 @@ def ollama_chat(host, model, messages, tools, timeout=300, no_think=True):
                 m["content"] = m["content"] + " /no_think"
                 break
     body = json.dumps({"model": model, "messages": msgs, "tools": tools, "stream": False, "think": False,
-                       "options": {"temperature": 0}, "keep_alive": "10m"}).encode()
+                       "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": num_predict},
+                       "keep_alive": "10m"}).encode()
     req = urllib.request.Request(host.rstrip("/") + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())["message"]
+        data = json.loads(r.read())
+    msg = data["message"]
+    # timing from Ollama (nanoseconds), kept under a private key; run_agent logs it and never stores it in the history
+    msg["_stats"] = {k: data[k] for k in ("load_duration", "prompt_eval_count", "prompt_eval_duration",
+                                          "eval_count", "eval_duration", "done_reason") if k in data}
+    return msg
 
 
 def new_history():
-    return [{"role": "system", "content": SYSTEM}]
+    return [{"role": "system", "content": SYSTEM + EXAMPLES}]
 
 
 def trim(history, keep=40):
@@ -259,25 +295,62 @@ def trim(history, keep=40):
         del history[1:j]
 
 
-def run_agent(history, user_text, execute, chat, scene_fn=None, max_steps=8, log=print):
-    """One user turn. `execute(name, clean_args) -> dict`, `chat(messages) -> message dict`."""
+def compact_old_scenes(history, upto):
+    """Earlier turns keep only the request: their [Current scene] lines are stale and cost ~300 tokens each."""
+    for m in history[:upto]:
+        if m["role"] == "user" and m["content"].startswith("[Current scene]"):
+            m["content"] = m["content"].split("[Request] ", 1)[-1]
+
+
+def is_rambling(msg, text):
+    """A reply with no tool call that hit the token cap or is far too long: the model is reasoning out loud."""
+    st = msg.get("_stats") or {}
+    return st.get("done_reason") == "length" or st.get("eval_count", 0) >= NUM_PREDICT - 1 \
+        or len(text) > MAX_REPLY_CHARS
+
+
+def run_agent(history, user_text, execute, chat, scene_fn=None, max_steps=8, log=print, fast_macros=None):
+    """One user turn. `execute(name, clean_args) -> dict`, `chat(messages) -> message dict`.
+    fast_macros (default: env UR_FAST_MACROS=1): after a successful build_tower / sort_cubes / move_home the result is
+    reported directly instead of asking the LLM for a closing sentence (saves one LLM call, 15-60 s).
+    Rambling replies (token cap hit, no tool call) are never stored; the model is retried with a temporary reminder."""
+    if fast_macros is None:
+        fast_macros = FAST_MACROS
     content = user_text
     if scene_fn:
         try:
-            content = f"[Current scene] {scene_fn()}\n\n[Request] {user_text}"
+            content = (f"[Current scene] {scene_fn()} Also on the table (not listed above): can, ball, block.\n\n"
+                       f"[Request] {user_text}")
         except Exception as e:
             log(f"(scene unavailable: {e})")
+    compact_old_scenes(history, len(history))
     history.append({"role": "user", "content": content})
     trim(history)
-    nudges = 0
+    nudges = rambles = 0
+    transient = None                       # reminder sent with the next call only, never stored
     call_re = r"\b(" + "|".join(TOOL_NAMES) + r")\s*\("
     for _ in range(max_steps):
+        msgs = history + [{"role": "user", "content": transient}] if transient else history
+        transient = None
         try:
-            msg = chat(history)
+            msg = chat(msgs)
         except Exception as e:
             return f"LLM error (is Ollama running and the model pulled?): {e}"
+        st = msg.get("_stats")
+        if st:
+            log(f"  .. llm: prompt {st.get('prompt_eval_count', '?')} tok in {st.get('prompt_eval_duration', 0) / 1e9:.1f}s, "
+                f"output {st.get('eval_count', '?')} tok in {st.get('eval_duration', 0) / 1e9:.1f}s, "
+                f"load {st.get('load_duration', 0) / 1e9:.1f}s")
         text = clean_text(msg.get("content"))
         calls = msg.get("tool_calls") or salvage_calls(text)
+        if not calls and is_rambling(msg, text):
+            rambles += 1
+            log(f"  .. rambling reply dropped ({len(text)} chars, retry {rambles}/{MAX_RAMBLES})")
+            if rambles > MAX_RAMBLES:
+                return "I could not work out how to do that. Please rephrase the request."
+            transient = (f'Stop explaining. The request is: "{user_text}". '
+                         "Reply with ONLY the next tool call through the tool interface, or one short sentence if done.")
+            continue
         if calls and not msg.get("tool_calls"):
             text = ""                       # the text WAS the call
             log("  .. salvaged tool call from text")
@@ -286,7 +359,7 @@ def run_agent(history, user_text, execute, chat, scene_fn=None, max_steps=8, log
             entry["tool_calls"] = calls
         history.append(entry)
         if not calls:
-            looks_like_call = re.search(call_re, text)
+            looks_like_call = re.search(call_re, text) or text.strip(" `") in TOOL_NAMES
             if looks_like_call and nudges < 2:
                 nudges += 1
                 history.append({"role": "user", "content":
@@ -297,6 +370,7 @@ def run_agent(history, user_text, execute, chat, scene_fn=None, max_steps=8, log
             if looks_like_call:
                 return "I could not carry out that request (the model kept writing tool calls as text instead of calling them)."
             return text or "(no response)"
+        done = []
         for c in calls:
             fn = c.get("function", {})
             name, args = fn.get("name", ""), fn.get("arguments", {})
@@ -314,4 +388,10 @@ def run_agent(history, user_text, execute, chat, scene_fn=None, max_steps=8, log
                 result = execute(name, clean)
                 log(f"  <- {result}")
             history.append({"role": "tool", "tool_name": name, "content": json.dumps(result)})
+            done.append((name, result))
+        if fast_macros and done and all(n in MACRO_TOOLS and r.get("success") for n, r in done):
+            reply = "Done: " + "; ".join(str(r.get("message", "ok")) for _, r in done) + "."
+            history.append({"role": "assistant", "content": reply})
+            log("  .. fast reply (no closing LLM call)")
+            return reply
     return "Stopped: too many tool steps."

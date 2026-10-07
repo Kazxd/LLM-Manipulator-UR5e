@@ -5,10 +5,12 @@ from ur_llm_bridge.agent import zone_contains
 
 WORLD = "pick_place"
 POSE_TOPIC = f"/world/{WORLD}/pose/info"
-CUBES = ("red_cube", "green_cube", "blue_cube")
-TABLE_Z = 0.225                      # cube centre when resting on the table
+EXTRA_MODELS = {"can": "yellow_can", "ball": "purple_ball", "block": "white_block"}   # need detect_open
+# Every model whose pose is tracked (cubes + extra objects). The name CUBES is kept because benchmark.py uses it.
+CUBES = ("red_cube", "green_cube", "blue_cube") + tuple(EXTRA_MODELS.values())
+TABLE_Z = 0.225                      # object centre when resting on the table (all objects are 5 cm tall)
 CUBE = 0.05
-INIT = {"red_cube": (0.5, 0.1, TABLE_Z),
+INIT = {"red_cube": (0.5, 0.1, TABLE_Z),                # reset_scene puts these back; extras are reset by /reset_state
         "green_cube": (0.7, 0.12, TABLE_Z),
         "blue_cube": (0.6, -0.15, TABLE_Z)}
 
@@ -48,9 +50,18 @@ CASES = [
     ("info_objects",    "info",       "what objects are on the table?",
         ("all", [("unchanged",), ("reply_has", "red", "green", "blue")])),
     ("info_home",       "info",       "go to the home position",  ("unchanged",)),
-    ("refuse_purple",   "refusal",    "pick up the purple cube",  ("unchanged",)),
+    ("refuse_orange",   "refusal",    "pick up the orange cube",  ("unchanged",)),
     ("refuse_ambiguous", "refusal",   "move the cube to the left", ("unchanged",)),
     ("refuse_range",    "refusal",    "put the red cube at x 3 and y 3", ("unchanged",)),
+    # extra objects: need `ros2 run ur_perception detect_open` (slower: OWL-ViT runs in every skill)
+    ("pick_can",        "objects",    "pick up the can",          ("held", "can")),
+    ("pick_ball",       "objects",    "pick up the ball",         ("held", "ball")),
+    ("pick_block",      "objects",    "pick up the white block",  ("held", "block")),
+    ("xy_can",          "objects",    "move the can to x 0.5 and y 0.0",  ("at", "can", 0.5, 0.0)),
+    ("xy_ball",         "objects",    "put the ball on the table at x 0.5 y 0.2", ("at", "ball", 0.5, 0.2)),
+    ("can_on_red",      "objects",    "put the can on top of the red cube", ("on", "can", "red")),
+    ("ball_on_block",   "objects",    "put the ball on top of the white block", ("on", "ball", "block")),
+    ("zone_can_right",  "objects",    "put the can in the right zone", ("in_zone", "can", "right")),
 ]
 
 # direction -> (axis index along which it points, sign); base frame, seen from the robot looking along +x
@@ -58,6 +69,9 @@ REL_AXES = {"left": (1, 1.0), "right": (1, -1.0), "front": (0, -1.0), "behind": 
 
 
 def _c(name):
+    """'red' -> 'red_cube', 'can' -> 'yellow_can' (Gazebo model name)."""
+    if name in EXTRA_MODELS:
+        return EXTRA_MODELS[name]
     return name if name.endswith("_cube") else name + "_cube"
 
 
@@ -70,7 +84,7 @@ def _d3(a, b):
 
 
 def evaluate(spec, poses, init, reply=""):
-    """Return (passed, detail) by comparing final cube poses (world frame) with the spec."""
+    """Return (passed, detail) by comparing final object poses (world frame) with the spec."""
     kind = spec[0]
     if kind == "all":
         res = [evaluate(s, poses, init, reply) for s in spec[1]]
@@ -117,7 +131,7 @@ def evaluate(spec, poses, init, reply=""):
 
 
 def parse_gz_poses(text):
-    """Parse `gz topic -e` protobuf text for the cube models (zero fields are omitted there)."""
+    """Parse `gz topic -e` protobuf text for the tracked models (zero fields are omitted there)."""
     out = {}
     for name in CUBES:
         for m in re.finditer(r'name:\s*"%s"' % name, text):
